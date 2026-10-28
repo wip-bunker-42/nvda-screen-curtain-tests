@@ -76,8 +76,8 @@ jobs:
         run: |
           $testArgs = @('-v')
           switch ($env:TEST_SCOPE) {
-            'backend' { $testArgs += @('-k', 'test_screenCurtain', '-k', 'test_globalCommands') }
-            'panel' { $testArgs += @('-k', 'test_privacyAndSecuritySettingsPanel', '-k', 'test_screenCurtain', '-k', 'test_globalCommands') }
+            'backend' { $testArgs += @('-k', 'test_screenCurtain') }
+            'panel' { $testArgs += @('-k', 'test_privacyAndSecuritySettingsPanel', '-k', 'test_screenCurtain') }
             'all' { }
             default { throw 'Unexpected test scope' }
           }
