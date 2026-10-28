@@ -1,0 +1,17 @@
+#!/usr/bin/env python3
+Import(
+	[
+		"env",
+	],
+)
+
+vbufBaseObjs = [
+	env.Object(x)
+	for x in (
+		"storage.cpp",
+		"utils.cpp",
+		"backend.cpp",
+	)
+]
+
+Return("vbufBaseObjs")

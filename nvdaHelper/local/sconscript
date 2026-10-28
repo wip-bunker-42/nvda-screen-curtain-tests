@@ -1,0 +1,123 @@
+#!/usr/bin/env python3
+###
+# This file is a part of the NVDA project.
+# URL: http://www.nvda-project.org/
+# Copyright 2006-2010 NVDA contributers.
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License version 2.0, as published by
+# the Free Software Foundation.
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+# This license can be found at:
+# http://www.gnu.org/licenses/old-licenses/gpl-2.0.html
+###
+
+Import(
+	[
+		"env",
+		"detoursLib",
+		"apiHookObj",
+	],
+)
+
+winIPCUtilsObj = env.Object("./winIPCUtils", "../common/winIPCUtils.cpp")
+
+controllerRPCHeader, controllerRPCServerSource = env.MSRPCStubs(
+	target="./nvdaController",
+	source=[
+		"../interfaces/nvdaController/nvdaController.idl",
+		"../interfaces/nvdaController/nvdaController.acf",
+	],
+	MSRPCStubs_noClient=True,
+	MSRPCStubs_prefix="nvdaController_",
+)
+
+controllerInternalRPCHeader, controllerInternalRPCServerSource = env.MSRPCStubs(
+	target="./nvdaControllerInternal",
+	source=[
+		"../interfaces/nvdaControllerInternal/nvdaControllerInternal.idl",
+		"../interfaces/nvdaControllerInternal/nvdaControllerInternal.acf",
+	],
+	MSRPCStubs_noClient=True,
+	MSRPCStubs_prefix="nvdaControllerInternal_",
+)
+
+vbufRPCHeader, vbufRPCClientSource = env.MSRPCStubs(
+	target="./vbuf",
+	source=[
+		"../interfaces/vbuf/vbuf.idl",
+	],
+	MSRPCStubs_noServer=True,
+	MSRPCStubs_prefix="VBuf_",
+)
+
+nvdaInProcUtilsRPCHeader, nvdaInProcUtilsRPCClientSource = env.MSRPCStubs(
+	target="./nvdaInProcUtils",
+	source=[
+		"../interfaces/nvdaInProcUtils/nvdaInProcUtils.idl",
+		"../interfaces/nvdaInProcUtils/nvdaInProcUtils.acf",
+	],
+	MSRPCStubs_noServer=True,
+	MSRPCStubs_prefix="nvdaInProcUtils_",
+)
+
+displayModelRPCHeader, displayModelRPCClientSource = env.MSRPCStubs(
+	target="./displayModel",
+	source=[
+		"../interfaces/displayModel/displayModel.idl",
+		"../interfaces/displayModel/displayModel.acf",
+	],
+	MSRPCStubs_noServer=True,
+	MSRPCStubs_prefix="displayModel_",
+)
+
+localLib = env.SharedLibrary(
+	target="nvdaHelperLocal",
+	source=[
+		env["projectResFile"],
+		apiHookObj,
+		"nvdaHelperLocal.cpp",
+		"beeps.cpp",
+		vbufRPCClientSource,
+		nvdaInProcUtilsRPCClientSource,
+		displayModelRPCClientSource,
+		"rpcSrv.cpp",
+		"nvdaController.cpp",
+		winIPCUtilsObj,
+		controllerRPCServerSource,
+		"nvdaControllerInternal.cpp",
+		controllerInternalRPCServerSource,
+		"dllImportTableHooks.cpp",
+		"nvdaHelperLocal.def",
+		"textUtils.cpp",
+		"UIAUtils.cpp",
+		"UIAEventLimiter/api.cpp",
+		"UIAEventLimiter/rateLimitedEventHandler.cpp",
+		"UIAEventLimiter/utils.cpp",
+		"mixer.cpp",
+		"oleUtils.cpp",
+		"wasapi.cpp",
+		"screenCurtain.cpp",
+		"remoteAccess.cpp",
+		"crashDump.cpp",
+	],
+	LIBS=[
+		"advapi32.lib",
+		"user32",
+		"usp10",
+		"ole32",
+		"oleaut32",
+		"rpcrt4",
+		"shlwapi",
+		detoursLib,
+		"Gdi32",
+		"Gdiplus",
+		"Iphlpapi",
+		"Ws2_32",
+		"runtimeobject",
+		"dbghelp",
+	],
+)
+
+Return("localLib")

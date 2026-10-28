@@ -1,0 +1,95 @@
+EXPORTS
+	createRemoteBindingHandle
+	cancellableSendMessageTimeout
+	cancelCallEvent DATA
+	_notifySendMessageCancelled DATA
+	nvdaHelperLocal_initialize
+	nvdaHelperLocal_terminate
+	generateBeep
+	nvdaInProcUtils_registerNVDAProcess
+	nvdaInProcUtils_unregisterNVDAProcess
+	nvdaInProcUtils_sysListView32_getGroupInfo
+	nvdaInProcUtils_sysListView32_getColumnContent
+	nvdaInProcUtils_sysListView32_getColumnLocation
+	nvdaInProcUtils_sysListView32_getColumnHeader
+	nvdaInProcUtils_sysListView32_getColumnOrderArray
+	nvdaInProcUtils_dumpOnCrash
+	nvdaInProcUtils_IA2Text_findContentDescendant
+	nvdaInProcUtils_getTextFromIAccessible
+	nvdaInProcUtils_getActiveObject
+	nvdaInProcUtils_winword_expandToLine
+	nvdaInProcUtils_winword_getTextInRange
+	nvdaInProcUtils_winword_moveByLine
+	nvdaInProcUtils_outlook_getMAPIProp
+	nvdaInProcUtils_excel_getCellInfos
+	VBuf_createBuffer
+	VBuf_destroyBuffer
+	VBuf_findNodeByAttributes
+	VBuf_getControlFieldNodeWithIdentifier
+	VBuf_getFieldNodeOffsets
+	VBuf_getIdentifierFromControlFieldNode
+	VBuf_getLineOffsets
+	VBuf_getSelectionOffsets
+	VBuf_getTextInRange
+	VBuf_getTextLength
+	VBuf_isFieldNodeAtOffset
+	VBuf_locateControlFieldNodeAtOffset
+	VBuf_locateTextFieldNodeAtOffset
+	VBuf_setSelectionOffsets
+	_nvdaControllerInternal_requestRegistration DATA
+	_nvdaControllerInternal_displayModelTextChangeNotify DATA
+	_nvdaControllerInternal_inputLangChangeNotify DATA
+	_nvdaControllerInternal_inputCompositionUpdate DATA
+	_nvdaControllerInternal_inputCandidateListUpdate DATA
+	_nvdaControllerInternal_IMEOpenStatusUpdate DATA
+	_nvdaControllerInternal_inputConversionModeUpdate DATA
+	_nvdaControllerInternal_logMessage DATA
+	_nvdaControllerInternal_typedCharacterNotify DATA
+	_nvdaControllerInternal_installAddonPackageFromPath DATA
+	_nvdaControllerInternal_handleRemoteURL DATA
+	_nvdaControllerInternal_drawFocusRectNotify DATA
+	_nvdaController_brailleMessage DATA
+	_nvdaController_cancelSpeech DATA
+	_nvdaController_speakText DATA
+	_nvdaController_speakSsml DATA
+	_nvdaController_isSpeaking DATA
+	nvdaController_onSsmlMarkReached
+	_nvdaControllerInternal_vbufChangeNotify DATA
+	displayModel_getWindowTextInRect
+	displayModel_getFocusRect
+	displayModel_getCaretRect
+	displayModel_requestTextChangeNotificationsForWindow
+	calculateWordOffsets
+	calculateCharacterOffsets
+	calculateCharacterBoundaries
+	findWindowWithClassInThread
+	registerUIAProperty
+	registerUIAAnnotationType
+	dllImportTableHooks_hookSingle
+	dllImportTableHooks_unhookSingle
+	audioDucking_shouldDelay
+	logMessage
+	getOleClipboardText
+	getOleUserType
+	_nvdaControllerInternal_reportLiveRegion DATA
+	_nvdaControllerInternal_openConfigDirectory DATA
+	rateLimitedUIAEventHandler_create
+	rateLimitedUIAEventHandler_terminate
+	wasPlay_create
+	wasPlay_destroy
+	wasPlay_open
+	wasPlay_feed
+	wasPlay_stop
+	wasPlay_sync
+	wasPlay_idle
+	wasPlay_pause
+	wasPlay_resume
+	wasPlay_setChannelVolume
+	wasPlay_startTrimmingLeadingSilence
+	wasPlay_startup
+	wasSilence_init
+	wasSilence_playFor
+	wasSilence_terminate
+	isScreenFullyBlack
+	localListeningSocketExists
+	writeCrashDump

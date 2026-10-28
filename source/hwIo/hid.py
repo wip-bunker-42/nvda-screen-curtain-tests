@@ -1,0 +1,337 @@
+# A part of NonVisual Desktop Access (NVDA)
+# Copyright (C) 2015-2026 NV Access Limited, Babbage B.V.
+# This file may be used under the terms of the GNU General Public License, version 2 or later, as modified by the NVDA license.
+# For full terms and any additional permissions, see the NVDA license file: https://github.com/nvaccess/nvda/blob/master/copying.txt
+
+"""Raw input/output for braille displays via HID
+Braille display drivers must be thread-safe to use this, as it utilises a background thread.
+See L{braille.BrailleDisplayDriver.isThreadSafe}.
+"""
+
+import ctypes  # noqa: I001
+from ctypes import byref
+from ctypes.wintypes import USHORT
+from collections.abc import Callable
+from .ioThread import IoThread
+
+from serial.win32 import FILE_FLAG_OVERLAPPED, INVALID_HANDLE_VALUE, CreateFile
+import winKernel
+from logHandler import log
+from .base import IoBase, _isDebug
+import hidpi
+import winBindings.hid
+from utils import _deprecate
+from winBindings import kernel32
+
+
+__getattr__ = _deprecate.handleDeprecations(
+	_deprecate.MovedSymbol("hidDll", "winBindings.hid", "dll"),
+)
+
+
+class HidPError(RuntimeError):
+	pass
+
+
+def check_HidP_status(func, *args):
+	res = func(*args)
+	res = ctypes.c_ulong(res).value
+	if res != hidpi.HIDP_STATUS.SUCCESS:
+		try:
+			code = hidpi.HIDP_STATUS(res)
+		except ValueError:
+			code = res
+		raise HidPError(func.__name__, str(code))
+
+
+class HidReport:
+	_reportType: hidpi.HIDP_REPORT_TYPE
+	_reportSize: int
+	_reportBuf: "ctypes.Array"
+
+	def __init__(self, device):
+		self._dev = device
+
+
+class HidInputReport(HidReport):
+	_reportType = hidpi.HIDP_REPORT_TYPE.INPUT
+
+	def __init__(self, device, data):
+		self._reportSize = device.caps.InputReportByteLength
+		self._reportBuf = ctypes.c_buffer(data, size=self._reportSize)
+		super().__init__(device)
+
+	def getUsages(self, usagePage, linkCollection=0):
+		maxUsages = winBindings.hid.HidP_MaxUsageListLength(self._reportType, usagePage, self._dev._pd)
+		numUsages = ctypes.c_long(maxUsages)
+		usageList = (hidpi.USAGE * maxUsages)()
+		check_HidP_status(
+			winBindings.hid.HidP_GetUsages,
+			self._reportType,
+			hidpi.USAGE(usagePage),
+			USHORT(linkCollection),
+			ctypes.byref(usageList),
+			ctypes.byref(numUsages),
+			self._dev._pd,
+			self._reportBuf,
+			self._reportSize,
+		)
+		return usageList[0 : numUsages.value]
+
+	def getDataItems(self):
+		maxDataLength = winBindings.hid.HidP_MaxDataListLength(self._reportType, self._dev._pd)
+		numDataLength = ctypes.c_ulong(maxDataLength)
+		dataList = (hidpi.HIDP_DATA * maxDataLength)()
+		check_HidP_status(
+			winBindings.hid.HidP_GetData,
+			self._reportType,
+			dataList,
+			ctypes.byref(numDataLength),
+			self._dev._pd,
+			self._reportBuf,
+			self._reportSize,
+		)
+		return dataList[0 : numDataLength.value]
+
+
+class HidOutputReport(HidReport):
+	_reportType = hidpi.HIDP_REPORT_TYPE.OUTPUT
+
+	def __init__(self, device, reportID=0):
+		self._reportSize = device.caps.OutputReportByteLength
+		self._reportBuf = ctypes.c_buffer(self._reportSize)
+		self._reportBuf[0] = reportID
+		super().__init__(device)
+
+	@property
+	def data(self):
+		return self._reportBuf.raw
+
+	def setUsageValueArray(self, usagePage, linkCollection, usage, data):
+		dataBuf = ctypes.c_buffer(data)
+		check_HidP_status(
+			winBindings.hid.HidP_SetUsageValueArray,
+			self._reportType,
+			usagePage,
+			linkCollection,
+			usage,
+			dataBuf,
+			len(dataBuf),
+			self._dev._pd,
+			self._reportBuf,
+			self._reportSize,
+		)
+
+
+class Hid(IoBase):
+	"""Raw I/O for HID devices."""
+
+	_featureSize: int
+
+	def __init__(
+		self,
+		path: str,
+		onReceive: Callable[[bytes], None],
+		exclusive: bool = True,
+		onReadError: Callable[[int], bool] | None = None,
+		ioThread: IoThread | None = None,
+	):
+		"""Constructor.
+		@param path: The device path.
+			This can be retrieved using L{hwPortUtils.listHidDevices}.
+		@param onReceive: A callable taking a received input report as its only argument.
+		@param exclusive: Whether to block other application's access to this device.
+		@param onReadError: An optional callable that handles read errors.
+			It takes an error code and returns True if the error has been handled,
+			allowing the read loop to exit cleanly, or False if an exception should be thrown.
+		@param ioThread: If provided, the I/O thread used for background reads.
+			if C{None}, defaults to L{hwIo.bgThread}
+		"""
+		if _isDebug():
+			log.debug("Opening device %s" % path)  # noqa: UP031
+		handle = CreateFile(
+			path,
+			kernel32.GENERIC.READ | kernel32.GENERIC.WRITE,
+			0 if exclusive else winKernel.FILE_SHARE_READ | winKernel.FILE_SHARE_WRITE,
+			None,
+			winKernel.OPEN_EXISTING,
+			FILE_FLAG_OVERLAPPED,
+			None,
+		)
+		if handle == INVALID_HANDLE_VALUE:
+			if _isDebug():
+				log.debug("Open failed: %s" % ctypes.WinError())  # noqa: UP031
+			raise ctypes.WinError()
+		pd = ctypes.c_void_p()
+		if not winBindings.hid.HidD_GetPreparsedData(handle, byref(pd)):
+			raise ctypes.WinError()
+		self._pd = pd
+		caps = self.caps
+		self.usagePage = caps.UsagePage
+		if _isDebug():
+			log.debug("usage ID: 0X%X" % caps.Usage)  # noqa: UP031
+			log.debug("usage page: 0X%X" % caps.UsagePage)  # noqa: UP031
+			log.debug(
+				"Report byte lengths: input %d, output %d, feature %d"  # noqa: UP031
+				% (
+					caps.InputReportByteLength,
+					caps.OutputReportByteLength,
+					caps.FeatureReportByteLength,
+				),
+			)
+		self._featureSize = caps.FeatureReportByteLength
+		self._writeSize = caps.OutputReportByteLength
+		self._readSize = caps.InputReportByteLength
+		# Reading any less than caps.InputReportByteLength is an error.
+		self._isClosed = False
+		super().__init__(
+			handle,
+			onReceive,
+			onReceiveSize=caps.InputReportByteLength,
+			onReadError=onReadError,
+			ioThread=ioThread,
+		)
+
+	@property
+	def caps(self):
+		if hasattr(self, "_caps"):
+			return self._caps
+		caps = hidpi.HIDP_CAPS()
+		check_HidP_status(winBindings.hid.HidP_GetCaps, self._pd, byref(caps))
+		self._caps = caps
+		return self._caps
+
+	@property
+	def inputButtonCaps(self) -> ctypes.Array[hidpi.HIDP_BUTTON_CAPS]:
+		if hasattr(self, "_inputButtonCaps"):
+			return self._inputButtonCaps
+		buttonCapsList = (hidpi.HIDP_BUTTON_CAPS * self.caps.NumberInputButtonCaps)()
+		numButtonCaps = ctypes.c_ushort(self.caps.NumberInputButtonCaps)
+		if numButtonCaps.value == 0:
+			return buttonCapsList
+		check_HidP_status(
+			winBindings.hid.HidP_GetButtonCaps,
+			hidpi.HIDP_REPORT_TYPE.INPUT,
+			buttonCapsList,
+			ctypes.byref(numButtonCaps),
+			self._pd,
+		)
+		self._inputButtonCaps = buttonCapsList
+		return self._inputButtonCaps
+
+	@property
+	def inputValueCaps(self) -> ctypes.Array[hidpi.HIDP_VALUE_CAPS]:
+		if hasattr(self, "_inputValueCaps"):
+			return self._inputValueCaps
+		valueCapsList = (hidpi.HIDP_VALUE_CAPS * self.caps.NumberInputValueCaps)()
+		numValueCaps = ctypes.c_ushort(self.caps.NumberInputValueCaps)
+		if numValueCaps.value == 0:
+			return valueCapsList
+		check_HidP_status(
+			winBindings.hid.HidP_GetValueCaps,
+			hidpi.HIDP_REPORT_TYPE.INPUT,
+			valueCapsList,
+			ctypes.byref(numValueCaps),
+			self._pd,
+		)
+		self._inputValueCaps = valueCapsList
+		return self._inputValueCaps
+
+	@property
+	def outputValueCaps(self) -> ctypes.Array[hidpi.HIDP_VALUE_CAPS]:
+		if hasattr(self, "_outputValueCaps"):
+			return self._outputValueCaps
+		valueCapsList = (hidpi.HIDP_VALUE_CAPS * self.caps.NumberOutputValueCaps)()
+		numValueCaps = ctypes.c_ushort(self.caps.NumberOutputValueCaps)
+		if numValueCaps.value == 0:
+			return valueCapsList
+		check_HidP_status(
+			winBindings.hid.HidP_GetValueCaps,
+			hidpi.HIDP_REPORT_TYPE.OUTPUT,
+			valueCapsList,
+			ctypes.byref(numValueCaps),
+			self._pd,
+		)
+		self._outputValueCaps = valueCapsList
+		return self._outputValueCaps
+
+	def _prepareWriteBuffer(self, data: bytes) -> tuple[int, ctypes.c_char_p]:
+		"""For HID devices, the buffer to be written must match the
+		OutputReportByteLength fetched from HIDP_CAPS, to ensure this is the case
+		we create a buffer of that size. We also check that data is not bigger than
+		the write size, which we do not currently support. If it becomes necessary to
+		support this, we could split the data and send it several chunks.
+		"""
+		# On Windows 7, writing any less than caps.OutputReportByteLength is also an error.
+		# See also: http://www.onarm.com/forum/20152/
+		if len(data) > self._writeSize:
+			log.error("Attempting to send a buffer larger than supported.")
+			raise RuntimeError("Unable to send buffer of: %d", len(data))
+		return (
+			self._writeSize,
+			ctypes.create_string_buffer(data, self._writeSize),
+		)
+
+	def getFeature(self, reportId: bytes) -> bytes:
+		"""Get a feature report from this device.
+		@param reportId: The report id.
+		@return: The report, including the report id.
+		"""
+		buf = ctypes.create_string_buffer(reportId, size=self._featureSize)
+		if not winBindings.hid.HidD_GetFeature(self._file, buf, self._featureSize):
+			if _isDebug():
+				log.debug(
+					"Get feature %r failed: %s" % (reportId, ctypes.WinError()),  # noqa: UP031
+				)
+			raise ctypes.WinError()
+		if _isDebug():
+			log.debug("Get feature: %r" % buf.raw)  # noqa: UP031
+		return buf.raw
+
+	def setFeature(self, report: bytes) -> None:
+		"""Send a feature report to this device.
+		@param report: The report, including its id.
+		"""
+		buf = ctypes.create_string_buffer(report, size=len(report))
+		bufSize = ctypes.sizeof(buf)
+		if _isDebug():
+			log.debug("Set feature: %r" % report)  # noqa: UP031
+		result = winBindings.hid.HidD_SetFeature(
+			self._file,
+			buf,
+			bufSize,
+		)
+		if not result:
+			if _isDebug():
+				log.debug("Set feature failed: %s" % ctypes.WinError())  # noqa: UP031
+			raise ctypes.WinError()
+
+	def setOutputReport(self, report: bytes) -> None:
+		"""
+		Write the given report to the device using HidD_SetOutputReport.
+		This is instead of using the standard WriteFile which may freeze with some USB HID implementations.
+		@param report: The report, including its id.
+		"""
+		buf = ctypes.create_string_buffer(report, size=len(report))
+		bufSize = ctypes.sizeof(buf)
+		if _isDebug():
+			log.debug("Set output report: %r" % report)  # noqa: UP031
+		result = winBindings.hid.HidD_SetOutputReport(
+			self._writeFile,
+			buf,
+			bufSize,
+		)
+		if not result:
+			if _isDebug():
+				log.debug("Set output report failed: %s" % ctypes.WinError())  # noqa: UP031
+			raise ctypes.WinError()
+
+	def close(self):
+		if self._isClosed:
+			log.debug("Attempted to close an already closed device.")
+			return
+		super().close()
+		winKernel.closeHandle(self._file)
+		self._file = None
+		winBindings.hid.HidD_FreePreparsedData(self._pd)
+		self._isClosed = True

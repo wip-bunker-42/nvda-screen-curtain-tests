@@ -1,0 +1,426 @@
+# A part of NonVisual Desktop Access (NVDA)
+# Copyright (C) 2006-2026 NV Access Limited, Peter Vágner, Joseph Lee
+# This file is covered by the GNU General Public License.
+# See the file COPYING for more details.
+
+from __future__ import annotations  # noqa: I001
+
+import argparse
+from ast import NodeTransformer, fix_missing_locations, parse
+import os
+import sys
+import gettext
+from typing import TYPE_CHECKING, Final
+from buildVersion import (
+	formatBuildVersionString,
+	name,
+	publisher,
+	version,
+)
+
+gettext.install("nvda")
+from glob import glob  # noqa: I001
+import fnmatch
+
+# versionInfo names must be imported after Gettext
+# Suppress E402 (module level import not at top of file)
+from versionInfo import (
+	copyright as NVDAcopyright,  # copyright is a reserved python keyword
+	description,
+)
+from py2exe import freeze
+from py2exe.dllfinder import DllFinder
+import py2exe.hooks
+import wx
+import importlib.machinery
+
+if TYPE_CHECKING:
+	from ast import AnnAssign  # noqa: I001
+	from py2exe.dllfinder import Scanner
+	from py2exe.mf310 import Module
+
+RT_MANIFEST = 24
+manifestTemplateFilePath = "manifest.template.xml"
+
+# py2exe's idea of whether a dll is a system dll appears to be wrong sometimes, so monkey patch it.
+orig_determine_dll_type = DllFinder.determine_dll_type
+
+
+def determine_dll_type(self, imagename):
+	dll = os.path.basename(imagename).lower()
+	if dll.startswith("api-ms-win-") or dll in ("powrprof.dll", "mpr.dll", "crypt32.dll"):
+		# These are definitely system dlls available on all systems and must be excluded.
+		# Including them can cause serious problems when a binary build is run on a different version of Windows.
+		return None
+	return orig_determine_dll_type(self, imagename)
+
+
+DllFinder.determine_dll_type = determine_dll_type
+
+
+class _Latex2mathmlSymbolsParserTransformer(NodeTransformer):
+	"""Rewrite the ``SYMBOLS_FILE`` path to resolve relative to the frozen executable."""
+
+	def __init__(self, relpath: str):
+		super().__init__()
+		self.rewritten: bool = False
+		self.relpath = relpath
+
+	def visit_AnnAssign(self, node: AnnAssign) -> AnnAssign:
+		# 1 indicates a "simple" target.
+		# That is, a target that consists solely of a Name node that does not appear between parentheses.
+		if node.simple == 1 and node.target.id == "SYMBOLS_FILE":
+			# Replace the original path expression with one based on sys.executable,
+			# so the frozen build finds the bundled unimathsymbols.txt.
+			node.value = (
+				# the result of parse is a ``ast.Module`` whose body contains one ``ast.Expr`` node.
+				# We only want the value of that expression.
+				parse(f"os.path.join(os.path.dirname(sys.executable), {self.relpath!r})").body[0].value
+			)
+			self.rewritten = True
+		return node
+
+
+def _hook_latex2mathml_symbols_parser(finder: Scanner, module: Module) -> None:
+	"""py2exe hook for the latex2mathml.symbols_parser module.
+
+	latex2mathml locates its ``unimathsymbols.txt`` data file at runtime
+	relative to its own package directory (via ``__file__``).
+	After the application is frozen, that path no longer exists, so this hook:
+
+	1. Copies the data file into the frozen distribution
+		so it ships alongside the executable.
+	2. Rewrites the module's ``SYMBOLS_FILE`` assignment via an AST transformation
+		so it resolves relative to ``sys.executable`` (the frozen exe)
+		instead of the original package location.
+	"""
+	import latex2mathml.symbols_parser
+
+	FILENAME: Final[str] = "unimathsymbols.txt"
+	RELPATH: Final[str] = os.path.join("latex2mathml", FILENAME)
+	# Include the data file in the frozen build output.
+	finder.add_datafile(
+		RELPATH,
+		os.path.join(os.path.dirname(latex2mathml.symbols_parser.__file__), FILENAME),
+	)
+	tree = parse(module.__source__)
+	# Inject ``import sys`` so the rewritten path expression can reference it.
+	tree.body.insert(0, parse("import sys").body[0])
+	transformer = _Latex2mathmlSymbolsParserTransformer(RELPATH)
+	newTree = fix_missing_locations(transformer.visit(tree))
+	if not transformer.rewritten:
+		raise RuntimeError(
+			"py2exe hook failed to rewrite SYMBOLS_FILE in latex2mathml.symbols_parser. The upstream module may have changed its variable declaration.",
+		)
+	module.__code_object__ = compile(newTree, module.__file__, "exec", optimize=module.__optimize__)
+
+
+# Register the hook with py2exe.
+# py2exe discovers hooks by name:
+# ``hook_<dotted_module_name_with_underscores>`` on the ``py2exe.hooks`` module.
+py2exe.hooks.hook_latex2mathml_symbols_parser = _hook_latex2mathml_symbols_parser
+
+
+def _parsePartialArguments() -> argparse.Namespace:
+	"""
+	Adds a command line option --enable-uiAccess to enable uiAccess for the main executable and EOA proxy
+	Allows py2exe to parse the rest of the arguments
+	"""
+	partialParser = argparse.ArgumentParser()
+	partialParser.add_argument(
+		"--enable-uiAccess",
+		dest="uiAccess",
+		action="store_true",
+		help="enable uiAccess for the main executable",
+		default=False,
+	)
+	partialArgs, _argslist = partialParser.parse_known_args(sys.argv)
+	return partialArgs
+
+
+_partialArgs = _parsePartialArguments()
+
+
+with open(manifestTemplateFilePath, "r", encoding="utf-8") as manifestTemplateFile:
+	_manifestTemplate = manifestTemplateFile.read()
+
+
+def getLocaleDataFiles():
+	wxDir = wx.__path__[0]
+	localeMoFiles = set()
+	for f in glob("locale/*/LC_MESSAGES"):
+		localeMoFiles.add((f, (os.path.join(f, "nvda.mo"),)))
+		wxMoFile = os.path.join(wxDir, f, "wxstd.mo")
+		if os.path.isfile(wxMoFile):
+			localeMoFiles.add((f, (wxMoFile,)))
+		lang = os.path.split(os.path.split(f)[0])[1]
+		if "_" in lang:
+			lang = lang.split("_")[0]
+			f = os.path.join("locale", lang, "lc_messages")
+			wxMoFile = os.path.join(wxDir, f, "wxstd.mo")
+			if os.path.isfile(wxMoFile):
+				localeMoFiles.add((f, (wxMoFile,)))
+	localeDicFiles = [(os.path.dirname(f), (f,)) for f in glob("locale/*/*.dic")]
+	NVDALocaleGestureMaps = [(os.path.dirname(f), (f,)) for f in glob("locale/*/gestures.ini")]
+	return list(localeMoFiles) + localeDicFiles + NVDALocaleGestureMaps
+
+
+def getRecursiveDataFiles(dest: str, source: str, excludes: tuple = ()) -> list[tuple[str, list[str]]]:
+	rulesList: list[tuple[str, list[str]]] = []
+	for file in glob(f"{source}/*"):
+		if not any(fnmatch.fnmatch(file, exclude) for exclude in excludes) and os.path.isfile(file):
+			rulesList.append((dest, [file]))
+	for dirName in os.listdir(source):
+		if os.path.isdir(os.path.join(source, dirName)) and not dirName.startswith("."):
+			rulesList.extend(
+				getRecursiveDataFiles(
+					os.path.join(dest, dirName),
+					os.path.join(source, dirName),
+					excludes=excludes,
+				),
+			)
+	return rulesList
+
+
+def _genManifestTemplate(shouldHaveUIAccess: bool) -> tuple[int, int, bytes]:
+	return (
+		RT_MANIFEST,
+		1,
+		(_manifestTemplate % {"uiAccess": shouldHaveUIAccess}).encode("utf-8"),
+	)
+
+
+_py2ExeWindows = [
+	{
+		"script": "nvda.pyw",
+		"dest_base": "nvda_noUIAccess",
+		"icon_resources": [(1, "images/nvda.ico")],
+		"other_resources": [_genManifestTemplate(shouldHaveUIAccess=False)],
+		"version_info": {
+			"version": formatBuildVersionString(),
+			"description": "NVDA application (no UIAccess)",
+			"product_name": name,
+			"product_version": version,
+			"copyright": NVDAcopyright,
+			"company_name": publisher,
+		},
+	},
+	# The nvda_uiAccess target will be added at runtime if required.
+	{
+		"script": "nvda_slave.pyw",
+		"icon_resources": [(1, "images/nvda.ico")],
+		"other_resources": [_genManifestTemplate(shouldHaveUIAccess=False)],
+		"version_info": {
+			"version": formatBuildVersionString(),
+			"description": name,
+			"product_name": name,
+			"product_version": version,
+			"copyright": NVDAcopyright,
+			"company_name": publisher,
+		},
+	},
+]
+if _partialArgs.uiAccess:
+	_py2ExeWindows.insert(
+		1,
+		{
+			"script": "nvda.pyw",
+			"dest_base": "nvda_uiAccess",
+			"icon_resources": [(1, "images/nvda.ico")],
+			"other_resources": [_genManifestTemplate(shouldHaveUIAccess=True)],
+			"version_info": {
+				"version": formatBuildVersionString(),
+				"description": "NVDA application (has UIAccess)",
+				"product_name": name,
+				"product_version": version,
+				"copyright": NVDAcopyright,
+				"company_name": publisher,
+			},
+		},
+	)
+
+
+freeze(
+	version_info={
+		"version": formatBuildVersionString(),
+		"description": description,
+		"product_name": name,
+		"product_version": version,
+		"copyright": NVDAcopyright,
+		"company_name": publisher,
+	},
+	windows=_py2ExeWindows,
+	console=[
+		{
+			"script": "l10nUtil.py",
+			"version_info": {
+				"version": formatBuildVersionString(),
+				"description": "NVDA Localization Utility",
+				"product_name": name,
+				"product_version": version,
+				"copyright": NVDAcopyright,
+				"company_name": publisher,
+			},
+		},
+	],
+	options={
+		"verbose": 2,
+		# Removes assertions for builds.
+		# https://docs.python.org/3.13/tutorial/modules.html#compiled-python-files
+		"optimize": 1,
+		"bundle_files": 3,
+		"dist_dir": "../dist",
+		"excludes": [
+			"tkinter",
+			"serial.loopback_connection",
+			"serial.rfc2217",
+			"serial.serialcli",
+			"serial.serialjava",
+			"serial.serialposix",
+			"serial.socket_connection",
+			# netbios (from pywin32) is optionally used by Python3's uuid module.
+			# This is not needed.
+			# We also need to exclude win32wnet explicitly.
+			"netbios",
+			"win32wnet",
+			# winxptheme is optionally used by wx.lib.agw.aui.
+			# We don't need this.
+			"winxptheme",
+			# numpy is an optional dependency of comtypes but we don't require it.
+			"numpy",
+			"concurrent.futures.process",
+			# Tomli is part of Python 3.11+ as Tomlib, but is imported as tomli by cryptography, which causes an infinite loop in py2exe
+			"tomli",
+		],
+		"packages": [
+			"NVDAObjects",
+			# As of py2exe 0.11.0.0 if the forcibly included package contains subpackages
+			# they need to be listed explicitly (py2exe issue 113).
+			"NVDAObjects.IAccessible",
+			"NVDAObjects.JAB",
+			"NVDAObjects.UIA",
+			"NVDAObjects.window",
+			# detect-secrets loads plugins and filters dynamically using pkgutil/importlib,
+			# so the relevant packages must be bundled explicitly for frozen builds.
+			"detect_secrets",
+			"detect_secrets.core",
+			"detect_secrets.core.plugins",
+			"detect_secrets.filters",
+			"detect_secrets.filters.gibberish",
+			"detect_secrets.plugins",
+			"detect_secrets.transformers",
+			"detect_secrets.util",
+			"virtualBuffers",
+			"appModules",
+			"comInterfaces",
+			"braille",
+			"braille.display",
+			"braille.regions",
+			"brailleDisplayDrivers",
+			"brailleDisplayDrivers.albatross",
+			"brailleDisplayDrivers.eurobraille",
+			"brailleDisplayDrivers.dotPad",
+			"brailleInput",
+			"synthDrivers",
+			"visionEnhancementProviders",
+			# Required for markdown, markdown implicitly imports this so it isn't picked up
+			"html.parser",
+			"lxml._elementpath",
+			"markdown.extensions",
+			"markdown_link_attr_modifier",
+			"mdx_truly_sane_lists",
+			"mdx_gh_links",
+			"pymdownx",
+			# The compiled winrt projection modules import this at C level, where
+			# modulefinder cannot see it, so bleak raises ModuleNotFoundError as soon as
+			# a Bluetooth Low Energy device is discovered.
+			"winrt.windows.foundation.collections",
+		],
+		"includes": [
+			"nvdaBuiltin",
+			# #3368: bisect was implicitly included with Python 2.7.3, but isn't with 2.7.5.
+			"bisect",
+			# robotremoteserver (for system tests) depends on xmlrpc.server
+			"xmlrpc.server",
+			# Required for RPYC over std pipes
+			"win32file",
+			"win32event",
+			"win32pipe",
+			# Referenced dynamically by hwPortUtils deprecation aliases.
+			"winBindings.cfgmgr32",
+		],
+	},
+	data_files=[
+		(".", glob("*.dll") + glob("*.manifest") + ["builtin.dic"]),
+		("documentation", ["../copying.txt"]),
+		("lib/%s/x86" % version, glob("lib/x86/*.dll") + glob("lib/x86/*.exe")),  # noqa: UP031
+		("lib/%s/x64" % version, glob("lib/x64/*.dll") + glob("lib/x64/*.exe")),  # noqa: UP031
+		("lib/%s/arm64" % version, glob("lib/arm64/*.dll") + glob("lib/arm64/*.exe")),  # noqa: UP031
+		("lib/%s/arm64ec" % version, glob("lib/arm64ec/*.dll") + glob("lib/arm64ec/*.exe")),  # noqa: UP031
+		("waves", glob("waves/*.wav")),
+		("images", glob("images/*.ico")),
+		("fonts", glob("fonts/*.ttf")),
+		("louis/tables", glob("louis/tables/*")),
+		("cppjieba/dicts", glob("cppjieba/dicts/*")),
+		("COMRegistrationFixes", glob("COMRegistrationFixes/*.reg")),
+		("miscDeps/tools", ["../miscDeps/tools/msgfmt.exe"]),
+		(".", glob("../miscDeps/python/*.dll")),
+		(".", ["message.html"]),
+		(".", [os.path.join(sys.base_prefix, "python3.dll")]),
+	]
+	+ (
+		getLocaleDataFiles()
+		+ (
+			getRecursiveDataFiles(
+				f"lib/{version}/x86/synthDriverHost-runtime",
+				"lib/x86/synthDriverHost-runtime",
+			)
+			if os.path.isdir("lib/x86/synthDriverHost-runtime")
+			else []
+		)
+		+ (
+			[
+				(
+					"_synthDrivers32",
+					glob("_synthDrivers32/**/*.py", recursive=True)
+					+ glob("_synthDrivers32/**/*.dll", recursive=True),
+				),
+			]
+			if os.path.isdir("lib/x86/synthDriverHost-runtime")
+			else []
+		)
+		+ getRecursiveDataFiles(
+			"include/nvda-mathcat/assets/Rules",
+			"../include/nvda-mathcat/assets/Rules",
+		)
+		+ getRecursiveDataFiles(
+			"synthDrivers",
+			"synthDrivers",
+			excludes=tuple(f"*{ext}" for ext in importlib.machinery.all_suffixes())
+			+ (
+				"*.exp",
+				"*.lib",
+				"*.pdb",
+			),
+		)
+		+ getRecursiveDataFiles(
+			"brailleDisplayDrivers",
+			"brailleDisplayDrivers",
+			excludes=tuple(f"*{ext}" for ext in importlib.machinery.all_suffixes()) + ("*.md",),
+		)
+		+ getRecursiveDataFiles(
+			"documentation",
+			"../user_docs",
+			excludes=tuple(f"*{ext}" for ext in importlib.machinery.all_suffixes())
+			+ (
+				"__pycache__",
+				"*.md",
+				"*.md.sub",
+				"*.xliff",
+				"*/user_docs/styles.css",
+				"*/user_docs/numberedHeadings.css",
+				"*/user_docs/favicon.ico",
+			),
+		)
+	),
+)

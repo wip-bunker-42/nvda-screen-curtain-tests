@@ -1,0 +1,117 @@
+/*
+This file is a part of the NVDA project.
+URL: http://www.nvda-project.org/
+Copyright 2006-2021 NV Access Limited, Leonard de Ruijter.
+    This program is free software: you can redistribute it and/or modify
+    it under the terms of the GNU General Public License version 2.0, as published by
+    the Free Software Foundation.
+    This program is distributed in the hope that it will be useful,
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+This license can be found at:
+http://www.gnu.org/licenses/old-licenses/gpl-2.0.html
+*/
+
+cpp_quote("/*")
+cpp_quote("This file is a part of the NVDA project.")
+cpp_quote("URL: http://www.nvda-project.org/")
+cpp_quote("Copyright 2006-2021 NV Access Limited, Leonard de Ruijter.")
+cpp_quote("This program is free software: you can redistribute it and/or modify")
+cpp_quote("it under the terms of the GNU General Public License version 2.0, as published by")
+cpp_quote("the Free Software Foundation.")
+cpp_quote("This program is distributed in the hope that it will be useful,")
+cpp_quote("but WITHOUT ANY WARRANTY; without even the implied warranty of")
+cpp_quote("MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.")
+cpp_quote("This license can be found at:")
+cpp_quote("http://www.gnu.org/licenses/old-licenses/gpl-2.0.html")
+cpp_quote("*/")
+
+import "wtypes.idl";
+import "oaidl.idl";
+
+typedef struct {
+	BSTR text;
+	BSTR address;
+	BSTR inputTitle;
+	BSTR inputMessage;
+	hyper nvCellStates;  // bitwise OR of the NvCellState enum values that apply to this cell.
+	long rowNumber;
+	long rowSpan;
+	long columnNumber;
+	long columnSpan;
+	long outlineLevel;
+	BSTR comments;
+	BSTR formula;
+} EXCEL_CELLINFO;
+
+/**
+ * Useful utlity methods that can be executed in-process from NVDA
+ */
+[
+	uuid(7D76FD13-1154-4b71-BB8F-BDA783DEA856),
+	version(1.0),
+]
+interface NvdaInProcUtils {
+
+	typedef [context_handle] void* nvdaRegistrationHandle_t;
+
+	error_status_t registerNVDAProcess([in] handle_t bindingHandle, [out] nvdaRegistrationHandle_t* registrationhandle);
+	error_status_t unregisterNVDAProcess([in,out] nvdaRegistrationHandle_t* registrationhandle);
+
+	error_status_t winword_expandToLine([in] const unsigned long windowHandle, [in] const int offset, [out] int* lineStart, [out] int* lineEnd);
+
+	error_status_t winword_getTextInRange([in] const unsigned long windowHandle, [in] const int startOffset, [in] const int endOffset, [in] const long formatConfig, [out] BSTR* text); 
+
+	error_status_t winword_moveByLine([in] const unsigned long windowHandle, [in] const int offset, [in] const int moveBack, [out] int* newOffset);
+
+	error_status_t sysListView32_getGroupInfo([in] const unsigned long windowHandle, [in] int groupIndex,  [out,string] BSTR* header, [out,string] BSTR* footer, [out] int* state);
+
+	error_status_t sysListView32_getColumnContent([in] const unsigned long windowHandle, [in] int item,  [in] int subItem, [out,string] BSTR* text);
+
+	cpp_quote("/* Actually maps to nvdaInProcUtils_sysListView32_getColumnLocation")
+	cpp_quote("*/")
+	error_status_t sysListView32_getColumnLocation([in] const unsigned long windowHandle, [in] int item,  [in] int subItem, [out] RECT* location);
+
+	cpp_quote("/* Actually maps to nvdaInProcUtils_sysListView32_getColumnHeader")
+	cpp_quote("*/")
+	error_status_t sysListView32_getColumnHeader([in] const unsigned long windowHandle, [in] int subItem, [out,string] BSTR* text);
+
+	cpp_quote("/* Actually maps to nvdaInProcUtils_sysListView32_getColumnOrderArray")
+	cpp_quote("*/")
+	error_status_t sysListView32_getColumnOrderArray([in] const unsigned long windowHandle, [in] const int columnCount, [out,size_is(columnCount)] int* columnOrderArray);
+
+	error_status_t getActiveObject([in] handle_t bindingHandle, [in,string] const wchar_t* progid, [out] IUnknown** ppUnknown);
+
+	error_status_t dumpOnCrash([in] handle_t bindingHandle, [in,string] const wchar_t* minidumpPath);
+
+	error_status_t IA2Text_findContentDescendant([in] handle_t bindingHandle, [in] const unsigned long hwnd, [in] long parentID, [in] long what, [out] long* descendantID, [out] long* descendantOffset);
+
+
+	cpp_quote("/* Actually maps to nvdaInProcUtils_getTextFromIAccessible")
+	cpp_quote("*/")
+	error_status_t getTextFromIAccessible(
+		[in] handle_t bindingHandle,
+		[in] const unsigned long hwnd,
+		[in] long parentID,
+		// Params for getTextFromIAccessible
+		[out, string] BSTR* textBuf,
+		[in, defaultvalue(TRUE)] const boolean recurse,
+		[in, defaultvalue(TRUE)] const boolean includeTopLevelText
+	);
+
+
+
+/*
+ * Fetches the  requested property from the given MAPIProp object.
+ * @param threadID the threadID of the Outlook GUI thread where the MAPI object came from.
+ * @param mapiObject the IUnknown interface of the MAPI object of a mail item in Outlook.
+ * Fetch it from the Outlook object model with something like Something like application.activeExplorer().selection.item(1).mapiObject
+ * @param mapiPropTag the property tag for the requested property. 
+ * In the form 0xAAAABBBB (where AAAA is the tag and BBBB is the type).
+ * @param value a pointer to a VARIANT that will hold the result.
+ */
+ 	error_status_t outlook_getMAPIProp(const long threadID, [in] IUnknown* mapiObject, const unsigned long mapiPropTag, [out] VARIANT* val);
+
+	error_status_t excel_getCellInfos([in] const unsigned long windowHandle,[in] BSTR rangeAddress, [in] long cellInfoFlags, [in] long cellCount, [out,size_is(cellCount)] EXCEL_CELLINFO* cellInfos, [out] long* numCellsFetched);
+
+}

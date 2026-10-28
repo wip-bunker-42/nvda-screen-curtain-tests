@@ -1,0 +1,286 @@
+#!/usr/bin/env python3
+# A part of NonVisual Desktop Access (NVDA)
+# Copyright (C) 2006-2026 NV Access Limited
+# This file may be used under the terms of the GNU General Public License, version 2 or later.
+# For more details see: https://www.gnu.org/licenses/gpl-2.0.html
+
+import sysconfig
+
+Import(
+	"env",
+	"sourceDir",
+	"sourceTypelibDir",
+	"libInstallDir",
+	"clientInstallDir",
+)
+
+
+# some utilities for COM proxies
+def clsidStringToCLSIDDefine(clsidString):
+	"""
+	Converts a CLSID string of the form "{abcdef12-abcd-abcd-abcd-abcdef123456}"
+	Into a c-style struct initializer for initializing a GUID (I.e. "{0xabcdef12,0xabcd,0xabcd,{0xab,0xcd,0xab,0xcd,0xef,0x12,0x34,0x56}}")
+	"""
+	d = clsidString[1:-1].replace("-", "")
+	return (
+		"{%s,%s,%s,%s}"  # noqa: UP031
+		% (
+			"0x" + d[0:8],
+			"0x" + d[8:12],
+			"0x" + d[12:16],
+			"{%s}" % (",".join("0x" + d[x : x + 2] for x in range(16, 32, 2))),  # noqa: UP031
+		)
+	)
+
+
+def COMProxyDllBuilder(env, target, source, proxyClsid):
+	"""
+	Builds a COM proxy dll from iid, proxy and dlldata c files generated from an IDL file with MIDL.
+	It provides the needed linker flags, and also embeds a manifest in the dll registering the given proxy CLSID for this dll's class object.
+	"""
+	proxyName = str(target)
+	manifestFile = env.Substfile(
+		target=proxyName + ".manifest",
+		source="COMProxy.manifest.subst",
+		SUBST_DICT={
+			"%proxyClsid%": proxyClsid,
+			"%proxyName%": proxyName,
+		},
+	)
+	proxyDll = env.SharedLibrary(
+		target=target,
+		source=source,
+		LIBS=["rpcrt4", "oleaut32", "ole32"],
+		CPPDEFINES=list(env["CPPDEFINES"])
+		+ [
+			"WIN32",
+			("PROXY_CLSID_IS", clsidStringToCLSIDDefine(proxyClsid)),
+		],
+		LINKFLAGS=[
+			env["LINKFLAGS"],
+			"/export:DllGetClassObject,private",
+			"/export:DllCanUnloadNow,private",
+			"/export:GetProxyDllInfo,private",
+			"/manifest:embed",
+			"/manifestinput:" + manifestFile[0].path,
+		],
+	)
+	env.Depends(proxyDll, manifestFile)
+	return proxyDll
+
+
+env.AddMethod(COMProxyDllBuilder, "COMProxyDll")
+
+# We only support compiling with MSVC 14.3 (2022) or newer
+if not env.get("MSVC_VERSION") or tuple(map(int, env.get("MSVC_VERSION").split("."))) < (14, 3):
+	raise RuntimeError("Visual C++ 14.3 (Visual Studio 2022) or newer not found")
+
+PYTHON_PLATFORM = sysconfig.get_platform()
+TARGET_ARCH = env["TARGET_ARCH"]
+isArm64EC = env.get("isArm64EC", False)
+
+
+isNVDACoreArch = (
+	(PYTHON_PLATFORM == "win32" and TARGET_ARCH == "x86")
+	or (PYTHON_PLATFORM == "win-amd64" and TARGET_ARCH == "x86_64")
+	or (PYTHON_PLATFORM == "win-arm64" and TARGET_ARCH == "arm64")
+)
+isNVDAHelperLocalArch = isNVDACoreArch or (
+	PYTHON_PLATFORM == "win-amd64" and TARGET_ARCH == "arm64" and isArm64EC
+)
+debug = env["nvdaHelperDebugFlags"]
+release = env["release"]
+signExec = env["signExec"] if (bool(env["certFile"]) ^ bool(env["apiSigningToken"])) else None
+
+# Some defines and includes for the environment
+env.Append(
+	CPPDEFINES=[
+		"UNICODE",
+		"_CRT_SECURE_NO_DEPRECATE",
+		("LOGLEVEL", "${nvdaHelperLogLevel}"),
+		("_WIN32_WINNT", "_WIN32_WINNT_WIN10"),
+		# NOMINMAX: prevent minwindef.h min/max macro definition, which unexpectedly override developer
+		# expectations
+		"NOMINMAX",
+	],
+)
+
+env.Append(CXXFLAGS=["/EHsc"])
+
+env.Append(CPPPATH=["#/include", "#/include/wil/include", "#/miscDeps/include", Dir(".").abspath])
+
+# Windows 10
+subsystem = "/subsystem:windows,10.00"
+
+env.Append(
+	LINKFLAGS=[
+		"/incremental:no",
+		"/WX",
+		subsystem,
+		"/release",  # We always want a checksum in the header
+	],
+)
+env.Append(
+	ARFLAGS=[
+		"/WX",
+		subsystem,
+	],
+)
+if TARGET_ARCH == "x86_64":
+	env.Append(MIDLFLAGS="/x64")
+elif TARGET_ARCH == "arm64":
+	env.Append(MIDLFLAGS="/x64" if isArm64EC else "/arm64")
+else:
+	env.Append(MIDLFLAGS="/win32")
+
+if not release:
+	env.Append(CCFLAGS=["/Od"])
+else:
+	env.Append(CCFLAGS="/O2")
+	env.Append(CCFLAGS="/GL")
+	env.Append(LINKFLAGS=["/LTCG"])
+	env.Append(ARFLAGS=["/LTCG"])
+
+if "debugCRT" not in debug:
+	env.Append(CPPDEFINES="NDEBUG")
+
+if "RTC" in debug:
+	env.Append(CCFLAGS=["/RTCsu"])
+
+
+# We always want debug symbols
+env.Append(PDB="${TARGET}.pdb")
+env.Append(
+	LINKFLAGS="/OPT:REF",
+)  # having symbols usually turns this off but we have no need for unused symbols
+
+env.Append(
+	CCFLAGS=[
+		"/std:c++20",
+		"/permissive-",
+		"/utf-8",
+		# '/showIncludes': Useful to understand which file causes some other file to be included.
+		# It will output a list of the include files.
+		# The option also displays nested include files, that is, the files
+		# included by the files that you include.
+	],
+)
+
+if isArm64EC:
+	env.Append(CCFLAGS="/arm64EC")
+	env.Append(LINKFLAGS="/machine:arm64ec")
+	env.Append(ARFLAGS="/machine:arm64ec")
+elif TARGET_ARCH != "arm64":
+	env.Append(LINKFLAGS="/CETCOMPAT")
+
+if "debugCRT" in debug:
+	env.Append(CCFLAGS=["/MTd"])
+else:
+	env.Append(CCFLAGS=["/MT"])
+
+# Don't enable warnings and warnings as errors or analysis to 3rd party code.
+thirdPartyEnv = env.Clone()
+
+env.Append(
+	CCFLAGS=[
+		"/W3",  # warning level 3
+	],
+)
+if "analyze" in debug:
+	env.Append(CCFLAGS=["/analyze"])
+	# Disable: Inconsistent annotation for 'x': this instance has no annotations.
+	# Seems all MIDL-generated code from idl files don't add annotations
+	env.Append(CCFLAGS="/wd28251")
+	# Disable: 'x': unreferenced formal parameter
+	# We use a great deal of hook functions where we have no need for various parameters
+	env.Append(CCFLAGS="/wd4100")
+else:
+	env.Append(
+		CCFLAGS=[
+			"/WX",  # warnings as error, don't do this with analyze, the build stops too early
+		],
+	)
+
+Export("thirdPartyEnv")
+Export("env")
+Export("isNVDACoreArch")
+
+acrobatAccessRPCStubs = env.SConscript("acrobatAccess_sconscript")
+Export("acrobatAccessRPCStubs")
+if isNVDACoreArch:
+	env.Install(sourceTypelibDir, acrobatAccessRPCStubs[0])  # typelib
+
+ia2RPCStubs = env.SConscript("ia2_sconscript")
+Export("ia2RPCStubs")
+if signExec:
+	env.AddPostAction(ia2RPCStubs[0], [signExec])
+env.Install(libInstallDir, ia2RPCStubs[0])  # proxy dll
+if isNVDACoreArch:
+	env.Install(sourceTypelibDir, ia2RPCStubs[1])  # typelib
+
+iSimpleDomRPCStubs = env.SConscript("ISimpleDOM_sconscript")
+if signExec:
+	env.AddPostAction(iSimpleDomRPCStubs[0], [signExec])
+env.Install(libInstallDir, iSimpleDomRPCStubs[0])  # proxy dll
+if isNVDACoreArch:
+	env.Install(sourceTypelibDir, iSimpleDomRPCStubs[1])  # typelib
+
+detoursLib = env.SConscript("detours/sconscript")
+Export("detoursLib")
+
+apiHookObj = env.Object("apiHook", "common/apiHook.cpp")
+Export("apiHookObj")
+
+cppjiebaLib = env.SConscript("cppjieba/sconscript")
+Export("cppjiebaLib")
+env.Install(libInstallDir, cppjiebaLib)
+
+localLib = env.SConscript("local/sconscript")
+Export("localLib")
+if signExec:
+	env.AddPostAction(localLib[0], [signExec])
+env.Install(libInstallDir, localLib)
+
+if isNVDAHelperLocalArch:
+	win10localLib = env.SConscript(
+		"localWin10/sconscript",
+	)
+	if signExec:
+		env.AddPostAction(win10localLib[0], [signExec])
+	env.Install(libInstallDir, win10localLib)
+	UIARemoteLib = env.SConscript("UIARemote/sconscript")
+	if signExec:
+		env.AddPostAction(UIARemoteLib[0], [signExec])
+	env.Install(libInstallDir, UIARemoteLib)
+
+clientLib = env.SConscript("client/sconscript")
+Export("clientLib")
+if signExec:
+	env.AddPostAction(clientLib[0], [signExec])
+env.Install(clientInstallDir, clientLib)
+
+remoteLib = env.SConscript("remote/sconscript")
+Export("remoteLib")
+if signExec:
+	env.AddPostAction(remoteLib[0], [signExec])
+env.Install(libInstallDir, remoteLib)
+
+if not isNVDAHelperLocalArch:
+	remoteLoaderProgram = env.SConscript("remoteLoader/sconscript")
+	if signExec:
+		env.AddPostAction(remoteLoaderProgram, [signExec])
+	env.Install(libInstallDir, remoteLoaderProgram)
+
+if isNVDACoreArch:
+	sonicLib = thirdPartyEnv.SConscript("sonic/sconscript")
+	Export("sonicLib")
+	env.Install(sourceDir.Dir("synthDrivers"), sonicLib)
+	thirdPartyEnv.SConscript("espeak/sconscript")
+	thirdPartyEnv.SConscript("liblouis/sconscript")
+	thirdPartyEnv.SConscript("javaAccessBridge/sconscript")
+	thirdPartyEnv.SConscript("uwp/sconscript")
+
+if TARGET_ARCH == "x86":
+	sonicLib = thirdPartyEnv.SConscript("sonic/sconscript")
+	Export("sonicLib")
+	env.Install(sourceDir.Dir("_synthDrivers32"), sonicLib)

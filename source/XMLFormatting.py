@@ -1,0 +1,92 @@
+# A part of NonVisual Desktop Access (NVDA)
+# Copyright (C) 2008-2021 NV Access Limited, Babbage B.V.
+# This file is covered by the GNU General Public License.
+# See the file COPYING for more details.
+
+import typing  # noqa: I001
+from xml.parsers import expat
+import textInfos
+import textUtils
+from logHandler import log
+from textUtils import WCHAR_ENCODING, isLowSurrogate
+
+CommandsT = typing.Union[textInfos.FieldCommand, str | None]  # noqa: UP007
+CommandListT = list[CommandsT]
+
+
+class XMLTextParser:
+	def __init__(self) -> None:
+		self._controlFieldStack: list[textInfos.ControlField] = []
+
+	def _startElementHandler(self, tagName, attrs):
+		if tagName == "unich":
+			data = attrs.get("value", None)
+			if data is not None:
+				try:
+					data = chr(int(data))
+				except ValueError:
+					data = textUtils.REPLACEMENT_CHAR
+				self._CharacterDataHandler(data, processBufferedSurrogates=isLowSurrogate(data))
+			return
+		elif tagName == "control":
+			newAttrs = textInfos.ControlField(attrs)
+			self._controlFieldStack.append(newAttrs)
+			self._commandList.append(textInfos.FieldCommand("controlStart", newAttrs))
+		elif tagName == "text":
+			newAttrs = textInfos.FormatField(attrs)
+			self._commandList.append(textInfos.FieldCommand("formatChange", newAttrs))
+		else:
+			raise ValueError("Unknown tag name: %s" % tagName)  # noqa: UP031
+
+		# Normalise attributes common to both field types.
+		try:
+			newAttrs["_startOfNode"] = newAttrs["_startOfNode"] == "1"
+		except KeyError:
+			pass
+		try:
+			newAttrs["_endOfNode"] = newAttrs["_endOfNode"] == "1"
+		except KeyError:
+			pass
+		try:
+			newAttrs["_offsetFromStartOfNode"] = int(newAttrs["_offsetFromStartOfNode"])
+		except KeyError:
+			pass
+		try:
+			newAttrs["_offsetFromEndOfNode"] = int(newAttrs["_offsetFromEndOfNode"])
+		except KeyError:
+			pass
+
+	def _EndElementHandler(self, tagName):
+		if tagName == "control":
+			attrs = self._controlFieldStack.pop()
+			self._commandList.append(textInfos.FieldCommand("controlEnd", attrs))
+		elif tagName in ("text", "unich"):
+			pass
+		else:
+			raise ValueError("unknown tag name: %s" % tagName)  # noqa: UP031
+
+	def _CharacterDataHandler(self, data: str | None, processBufferedSurrogates=False):
+		cmdList = self._commandList
+		if not isinstance(data, str):
+			dataStr = repr(data)
+			log.warning(f"unknown type for data: {dataStr}")
+		if cmdList and isinstance(cmdList[-1], str):
+			cmdList[-1] += data
+			if processBufferedSurrogates:
+				cmdList[-1] = (
+					cmdList[-1].encode(WCHAR_ENCODING, errors="surrogatepass").decode(WCHAR_ENCODING)
+				)
+		else:
+			cmdList.append(data)
+
+	def parse(self, XMLText) -> CommandListT:
+		parser = expat.ParserCreate("utf-8")
+		parser.StartElementHandler = self._startElementHandler
+		parser.EndElementHandler = self._EndElementHandler
+		parser.CharacterDataHandler = self._CharacterDataHandler
+		self._commandList: XMLTextParser.CommandListT = []
+		try:
+			parser.Parse(XMLText)
+		except Exception:
+			log.error("XML: %s" % XMLText, exc_info=True)  # noqa: G201, UP031
+		return self._commandList

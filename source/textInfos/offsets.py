@@ -1,0 +1,952 @@
+# A part of NonVisual Desktop Access (NVDA)
+# Copyright (C) 2006-2026 NV Access Limited, Babbage B.V., Leonard de Ruijter, Wang Chong
+# This file may be used under the terms of the GNU General Public License, version 2 or later, as modified by the NVDA license.
+# For full terms and any additional permissions, see the NVDA license file: https://github.com/nvaccess/nvda/blob/master/copying.txt
+
+from abc import abstractmethod  # noqa: I001
+import re
+import ctypes
+import unicodedata
+import NVDAHelper
+import config.featureFlagEnums
+import NVDAState
+import config
+from config.featureFlag import FeatureFlag
+import textInfos
+import locationHelper
+from treeInterceptorHandler import TreeInterceptor
+import textUtils
+from textUtils import icu
+from textUtils.segFlag import CharSegFlag, WordSegFlag
+from textUtils._wordSeg.wordSegmenter import WordSegmenter
+from winBindings.icu import ICU_AVAILABLE
+from dataclasses import dataclass
+from typing import (
+	Any,
+	Self,
+)
+from logHandler import log
+
+
+def _warnUseUniscribeDeprecated() -> None:
+	log.warning(
+		"OffsetsTextInfo.useUniscribe is deprecated. "
+		"Use OffsetsTextInfo.charSegFlag and OffsetsTextInfo.wordSegFlag instead.",
+		stack_info=True,
+	)
+
+
+def _getUseUniscribeClassOverride(textInfoClass: type) -> bool | None:
+	for klass in textInfoClass.__mro__:
+		override = klass.__dict__.get("_useUniscribeOverride")
+		if override is not None:
+			return bool(override)
+	return None
+
+
+class _OffsetsTextInfoMeta(type(textInfos.TextInfo)):
+	def __init__(
+		self,
+		name: str,
+		bases: tuple[type, ...],
+		namespace: dict[str, Any],
+		/,
+		**kwargs: Any,
+	) -> None:
+		super().__init__(name, bases, namespace, **kwargs)
+		legacyUseUniscribe = namespace.get("useUniscribe")
+		if not isinstance(legacyUseUniscribe, bool):
+			return
+		type.__delattr__(self, "useUniscribe")
+		type.__setattr__(self, "_useUniscribeOverride", legacyUseUniscribe)
+
+	def __getattribute__(self, name: str) -> Any:
+		if name != "useUniscribe" or not NVDAState._allowDeprecatedAPI():
+			return super().__getattribute__(name)
+		_warnUseUniscribeDeprecated()
+		override = _getUseUniscribeClassOverride(self)
+		if override is not None:
+			return override
+		return type.__getattribute__(self, "charSegFlag") == CharSegFlag.UNISCRIBE
+
+	def __setattr__(self, name: str, value: Any) -> None:
+		if name != "useUniscribe" or not NVDAState._allowDeprecatedAPI():
+			return super().__setattr__(name, value)
+		_warnUseUniscribeDeprecated()
+		type.__setattr__(self, "_useUniscribeOverride", bool(value))
+
+
+@dataclass
+class Offsets:
+	"""Represents two offsets."""
+
+	#: the first offset.
+	startOffset: int
+	#: the second offset.
+	endOffset: int
+
+
+def findStartOfLine(text, offset, lineLength=None):
+	"""Searches backwards through the given text from the given offset, until it finds the offset that is the start of the line. With out a set line length, it searches for new line / cariage return characters, with a set line length it simply moves back to sit on a multiple of the line length.
+	@param text: the text to search
+	@type text: str
+	@param offset: the offset of the text to start at
+	@type offset: int
+	@param lineLength: The number of characters that makes up a line, None if new line characters should be looked at instead
+	@type lineLength: int or None
+	@return: the found offset
+	@rtype: int
+	"""
+	if not text:
+		return 0
+	if offset >= len(text):
+		offset = len(text) - 1
+	if isinstance(lineLength, int):
+		return offset - (offset % lineLength)
+	if text[offset] == "\n" and offset >= 0 and text[offset - 1] == "\r":
+		offset -= 1
+	start = text.rfind("\n", 0, offset)
+	if start < 0:
+		start = text.rfind("\r", 0, offset)
+	if start < 0:
+		start = -1
+	return start + 1
+
+
+def findEndOfLine(text, offset, lineLength=None):
+	"""Searches forwards through the given text from the given offset, until it finds the offset that is the start of the next line. With out a set line length, it searches for new line / cariage return characters, with a set line length it simply moves forward to sit on a multiple of the line length.
+	@param text: the text to search
+	@type text: str
+	@param offset: the offset of the text to start at
+	@type offset: int
+	@param lineLength: The number of characters that makes up a line, None if new line characters should be looked at instead
+	@type lineLength: int or None
+	@return: the found offset
+	@rtype: int
+	"""
+	if not text:
+		return 0
+	if offset >= len(text):
+		offset = len(text) - 1
+	if isinstance(lineLength, int):
+		return offset - (offset % lineLength) + lineLength
+	end = offset
+	if text[end] != "\n":
+		end = text.find("\n", offset)
+	if end < 0:  # noqa: SIM102
+		if text[offset] != "\r":
+			end = text.find("\r", offset)
+	if end < 0:
+		end = len(text) - 1
+	return end + 1
+
+
+def findStartOfWord(text, offset, lineLength=None):
+	"""Searches backwards through the given text from the given offset, until it finds the offset that is the start of the word. It checks to see if a character is alphanumeric, or is another symbol , or is white space.
+	@param text: the text to search
+	@type text: str
+	@param offset: the offset of the text to start at
+	@type offset: int
+	@param lineLength: The number of characters that makes up a line, None if new line characters should be looked at instead
+	@type lineLength: int or None
+	@return: the found offset
+	@rtype: int
+	"""
+	if offset >= len(text):
+		return offset
+	while offset > 0 and text[offset].isspace():
+		offset -= 1
+	if unicodedata.category(text[offset])[0] not in "LMN":
+		return offset
+	else:
+		while offset > 0 and unicodedata.category(text[offset - 1])[0] in "LMN":
+			offset -= 1
+	return offset
+
+
+def findEndOfWord(text, offset, lineLength=None):
+	"""Searches forwards through the given text from the given offset, until it finds the offset that is the start of the next word. It checks to see if a character is alphanumeric, or is another symbol , or is white space.
+	@param text: the text to search
+	@type text: str
+	@param offset: the offset of the text to start at
+	@type offset: int
+	@param lineLength: The number of characters that makes up a line, None if new line characters should be looked at instead
+	@type lineLength: int or None
+	@return: the found offset
+	@rtype: int
+	"""
+	if offset >= len(text):
+		return offset + 1
+	if unicodedata.category(text[offset])[0] in "LMN":
+		while offset < len(text) and unicodedata.category(text[offset])[0] in "LMN":
+			offset += 1
+	elif unicodedata.category(text[offset])[0] not in "LMNZ":
+		offset += 1
+	while offset < len(text) and text[offset].isspace():
+		offset += 1
+	return offset
+
+
+class OffsetsTextInfo(textInfos.TextInfo, metaclass=_OffsetsTextInfoMeta):
+	"""An abstract TextInfo for text implementations which represent ranges using numeric offsets relative to the start of the text.
+	In such implementations, the start of the text is represented by 0 and the end is the length of the entire text.
+
+	All subclasses must implement L{_getStoryLength}.
+	Aside from this, there are two possible implementations:
+		* If the underlying text implementation does not support retrieval of line offsets, L{_getStoryText} should be implemented.
+		In this case, the base implementation of L{_getLineOffsets} will retrieve the entire text of the object and use text searching algorithms to find line offsets.
+		This is very inefficient and should be avoided if possible.
+		* Otherwise, subclasses must implement at least L{_getTextRange} and L{_getLineOffsets}.
+		Retrieval of other offsets (e.g. L{_getWordOffsets}) should also be implemented if possible for greatest accuracy and efficiency.
+
+	If a caret and/or selection should be supported, L{_getCaretOffset} and/or L{_getSelectionOffsets} should be implemented, respectively.
+	To support conversion from screen points (e.g. for mouse tracking), L{_getOffsetFromPoint} should be implemented.
+	To support conversion to screen rectangles and points (e.g. for magnification or mouse tracking), either L{_getBoundingRectFromOffset} or L{_getPointFromOffset} should be implemented.
+	Note that the base implementation of L{_getPointFromOffset} uses L{_getBoundingRectFromOffset}.
+	"""
+
+	#: Honours documentFormatting config option if true - set to false if this is not at all slow.
+	detectFormattingAfterCursorMaybeSlow: bool = True
+	#: Method to calculate character and word offsets.
+	charSegFlag: CharSegFlag = CharSegFlag.UNISCRIBE
+	#: Backing value for the deprecated useUniscribe compatibility attribute.
+	_useUniscribeOverride: bool | None = None
+
+	def _getDeprecatedUseUniscribe(self) -> bool:
+		if not NVDAState._allowDeprecatedAPI():
+			raise AttributeError(f"'{type(self).__name__}' object has no attribute 'useUniscribe'")
+		_warnUseUniscribeDeprecated()
+		override = self._getUseUniscribeCompatOverride()
+		if override is not None:
+			return override
+		return self._getEffectiveCharSegFlag() == CharSegFlag.UNISCRIBE and bool(
+			self._getEffectiveWordSegFlag(),
+		)
+
+	def _setDeprecatedUseUniscribe(self, value: bool) -> None:
+		if not NVDAState._allowDeprecatedAPI():
+			raise AttributeError(f"'{type(self).__name__}' object has no attribute 'useUniscribe'")
+		_warnUseUniscribeDeprecated()
+		self._useUniscribeOverride = bool(value)
+
+	# Deprecated pending removal in the 2027.1 API breaking release.
+	# Use charSegFlag and wordSegFlag instead.
+	useUniscribe = property(_getDeprecatedUseUniscribe, _setDeprecatedUseUniscribe)
+
+	def _getUseUniscribeCompatOverride(self) -> bool | None:
+		override = self.__dict__.get("_useUniscribeOverride")
+		if override is not None:
+			return bool(override)
+		return _getUseUniscribeClassOverride(type(self))
+
+	def _getEffectiveCharSegFlag(self) -> CharSegFlag:
+		useUniscribe = self._getUseUniscribeCompatOverride()
+		if useUniscribe is False:
+			return CharSegFlag.NONE
+		if useUniscribe is True:
+			return CharSegFlag.UNISCRIBE
+		return self.charSegFlag
+
+	def _getEffectiveWordSegFlag(self) -> WordSegFlag | None:
+		useUniscribe = self._getUseUniscribeCompatOverride()
+		if useUniscribe is False:
+			return WordSegFlag.NONE
+		if useUniscribe is True:
+			return WordSegFlag.UNISCRIBE
+		return self.wordSegFlag
+
+	@property
+	def wordSegFlag(self) -> WordSegFlag | None:
+		match self.wordSegConf.calculated():
+			case config.featureFlagEnums.WordNavigationUnitFlag.UNISCRIBE:
+				return WordSegFlag.UNISCRIBE
+			case config.featureFlagEnums.WordNavigationUnitFlag.AUTO:
+				return WordSegFlag.AUTO
+			case config.featureFlagEnums.WordNavigationUnitFlag.CHINESE:
+				return WordSegFlag.CHINESE
+			case config.featureFlagEnums.WordNavigationUnitFlag.ICU:
+				return WordSegFlag.ICU
+			case _:
+				log.error(f"Unknown word segmentation standard, {self.wordSegConf.calculated()!r}")
+		return None
+
+	#: The encoding internal to the underlying text info implementation.
+	encoding: str | None = textUtils.WCHAR_ENCODING
+
+	def __eq__(self, other):
+		if self is other or (  # noqa: SIM103
+			isinstance(other, OffsetsTextInfo)
+			and self._startOffset == other._startOffset
+			and self._endOffset == other._endOffset
+		):
+			return True
+		else:
+			return False
+
+	# As __eq__ was defined on this class, we must provide __hash__ to remain hashable.
+	# The default hash implementation is fine for  our purposes.
+	def __hash__(self):
+		return super().__hash__()
+
+	def _get_locationText(self):
+		textList = []
+		storyLength = self._getStoryLength() or 1
+		curPercent = (self._startOffset / float(storyLength)) * 100
+		# Translators: current position in a document as a percentage of the document length
+		textList.append(_("{curPercent:.0f}%").format(curPercent=curPercent))
+		try:
+			curPoint = self.pointAtStart
+		except (NotImplementedError, LookupError):
+			curPoint = None
+		if curPoint is not None:
+			# Translators: the current position's screen coordinates in pixels
+			textList.append(_("at {x}, {y}").format(x=curPoint.x, y=curPoint.y))
+		return ", ".join(textList)
+
+	# C901 '_get_boundingRects' is too complex
+	# Note: when working on _get_boundingRects, look for opportunities to simplify
+	# and move logic out into smaller helper functions.
+	def _get_boundingRects(self) -> list[locationHelper.RectLTWH]:
+		if self.isCollapsed:
+			return []
+		startOffset = self._startOffset
+		try:
+			firstVisibleOffset = self._getFirstVisibleOffset()
+			if firstVisibleOffset >= 0:
+				startOffset = max(startOffset, firstVisibleOffset)
+		except (LookupError, NotImplementedError):
+			pass
+		getLocationFromOffset = self._getBoundingRectFromOffset
+		try:
+			startLocation = getLocationFromOffset(startOffset)
+		except NotImplementedError:
+			# Getting bounding rectangles is not implemented.
+			# Therefore, we need to create a bounding rectangle with points.
+			# This, though less accurate, is acceptable for use cases within NVDA.
+			getLocationFromOffset = self._getPointFromOffset
+			startLocation = getLocationFromOffset(startOffset)
+		inclusiveEndOffset = self._endOffset - 1
+		try:
+			lastVisibleOffset = self._getLastVisibleOffset()
+			if lastVisibleOffset >= startOffset:
+				inclusiveEndOffset = min(inclusiveEndOffset, lastVisibleOffset)
+		except (LookupError, NotImplementedError):
+			pass
+		# If the inclusive end offset is greater than the start offset, we are working with a range.
+		# If not, i.e. the range only contains one character, we have only one location to deal with.
+		obj = self.obj.rootNVDAObject if isinstance(self.obj, TreeInterceptor) else self.obj
+		for i in range(100):
+			objLocation = obj.location
+			if objLocation:
+				break
+			obj = obj.parent
+		if not objLocation:
+			raise LookupError
+		rects = []
+		if inclusiveEndOffset > startOffset:
+			offset = startOffset
+			while offset <= inclusiveEndOffset:
+				lineStart, lineEnd = self._getLineOffsets(offset)
+				lineStart = max(lineStart, startOffset)
+				# Line offsets are exclusive, so the end offset is at the start of the next line, if any.
+				inclusiveLineEnd = lineEnd - 1
+				if inclusiveLineEnd > inclusiveEndOffset:  # noqa: PLR1730
+					# The end offset is in this line
+					inclusiveLineEnd = inclusiveEndOffset
+				rects.append(
+					locationHelper.RectLTWH.fromCollection(
+						startLocation if lineStart == startOffset else getLocationFromOffset(lineStart),
+						getLocationFromOffset(inclusiveLineEnd),
+					),
+				)
+				offset = inclusiveLineEnd + 1
+		else:
+			rects.append(
+				locationHelper.RectLTWH.fromCollection(
+					startLocation,
+				),
+			)
+		intersectedRects = []
+		for rect in rects:
+			intersection = rect.intersection(objLocation)
+			if not any(intersection):
+				continue
+			intersectedRects.append(intersection)
+		return intersectedRects
+
+	def _getCaretOffset(self):
+		raise NotImplementedError
+
+	def _setCaretOffset(self, offset):
+		raise NotImplementedError
+
+	def _getSelectionOffsets(self):
+		raise NotImplementedError
+
+	def _setSelectionOffsets(self, start, end):
+		raise NotImplementedError
+
+	@abstractmethod
+	def _getStoryLength(self):
+		raise NotImplementedError
+
+	def _getStoryText(self):
+		"""Retrieve the entire text of the object.
+		@return: The entire text of the object.
+		@rtype: str
+		"""
+		raise NotImplementedError
+
+	def _getTextRange(self, start, end):
+		"""Retrieve the text in a given offset range.
+		@param start: The start offset.
+		@type start: int
+		@param end: The end offset (exclusive).
+		@type end: int
+		@return: The text contained in the requested range.
+		@rtype: str
+		"""
+		text = self._getStoryText()
+		if self.encoding == textUtils.WCHAR_ENCODING:
+			offsetConverter = textUtils.WideStringOffsetConverter(text)
+			start, end = offsetConverter.encodedToStrOffsets(start, end)
+		elif not (
+			self.encoding is None
+			or self.encoding == "utf_32_le"
+			or self.encoding == textUtils.USER_ANSI_CODE_PAGE
+		):
+			raise NotImplementedError
+		return text[start:end]
+
+	def _getFormatFieldAndOffsets(self, offset, formatConfig, calculateOffsets=True):
+		"""Retrieve the formatting information for a given offset and the offsets spanned by that field.
+		Subclasses must override this if support for text formatting is desired.
+		The base implementation associates text with line numbers if possible.
+		"""
+		formatField = textInfos.FormatField()
+		startOffset, endOffset = self._startOffset, self._endOffset
+		if formatConfig["reportLineNumber"]:
+			if calculateOffsets:
+				startOffset, endOffset = self._getLineOffsets(offset)
+			lineNum = self._getLineNumFromOffset(offset)
+			if lineNum is not None:
+				formatField["line-number"] = lineNum + 1
+		return formatField, (startOffset, endOffset)
+
+	def _calculateUniscribeOffsets(
+		self,
+		lineText: str,
+		unit: str,
+		relOffset: int,
+	) -> tuple[int, int] | None:
+		"""
+		Calculates the bounds of a unit at an offset within a given string of text
+		using the Windows uniscribe  library, also used in Notepad, for example.
+		Units supported are character and word.
+		@param lineText: the text string to analyze
+		@param unit: the TextInfo unit (character or word)
+		@param relOffset: the character offset within the text string at which to calculate the bounds.
+		"""
+		if unit is textInfos.UNIT_WORD:
+			helperFunc = NVDAHelper.localLib.calculateWordOffsets
+		elif unit is textInfos.UNIT_CHARACTER:
+			helperFunc = NVDAHelper.localLib.calculateCharacterOffsets
+		else:
+			raise NotImplementedError(f"Unit: {unit}")
+		relStart = ctypes.c_int()
+		relEnd = ctypes.c_int()
+		# We can't rely on len(lineText) to calculate the length of the line.
+		offsetConverter = textUtils.WideStringOffsetConverter(lineText)
+		lineLength = offsetConverter.encodedStringLength
+		if self.encoding != textUtils.WCHAR_ENCODING:
+			# We need to convert the str based line offsets to wide string offsets.
+			relOffset = offsetConverter.strToEncodedOffsets(relOffset, relOffset)[0]
+		if helperFunc(
+			lineText,
+			lineLength,
+			relOffset,
+			ctypes.byref(relStart),
+			ctypes.byref(relEnd),
+		):
+			relStart = relStart.value
+			relEnd = relEnd.value
+			if self.encoding != textUtils.WCHAR_ENCODING:
+				# We need to convert the uniscribe based offsets to str offsets.
+				relStart, relEnd = offsetConverter.encodedToStrOffsets(relStart, relEnd)
+			return (relStart, relEnd)
+		log.debugWarning(f"Uniscribe failed to calculate {unit} offsets for text {lineText!r}")
+		return None
+
+	def _getCharacterOffsets(self, offset):
+		if not (
+			self.encoding == textUtils.WCHAR_ENCODING
+			or self.encoding is None
+			or self.encoding == "utf_32_le"
+			or self.encoding == textUtils.USER_ANSI_CODE_PAGE
+		):
+			raise NotImplementedError
+		lineStart, lineEnd = self._getLineOffsets(offset)
+		lineText = self._getTextRange(lineStart, lineEnd)
+		relOffset = offset - lineStart
+		if self._getEffectiveCharSegFlag() == CharSegFlag.UNISCRIBE:
+			offsets = self._calculateUniscribeOffsets(lineText, textInfos.UNIT_CHARACTER, relOffset)
+			if offsets is not None:
+				return (offsets[0] + lineStart, offsets[1] + lineStart)
+		if self.encoding == textUtils.WCHAR_ENCODING:
+			offsetConverter = textUtils.WideStringOffsetConverter(lineText)
+			relStrStart, relStrEnd = offsetConverter.encodedToStrOffsets(relOffset, relOffset + 1)
+			relWideStringStart, relWideStringEnd = offsetConverter.strToEncodedOffsets(relStrStart, relStrEnd)
+			return (relWideStringStart + lineStart, relWideStringEnd + lineStart)
+		return (offset, offset + 1)
+
+	def _getWordOffsets(self, offset):
+		if not (
+			self.encoding == textUtils.WCHAR_ENCODING
+			or self.encoding is None
+			or self.encoding == "utf_32_le"
+			or self.encoding == textUtils.USER_ANSI_CODE_PAGE
+		):
+			raise NotImplementedError
+		lineStart, lineEnd = self._getLineOffsets(offset)
+		lineText = self._getTextRange(lineStart, lineEnd)
+		# Convert NULL and non-breaking space to space to make sure that words will break on them
+		lineText = lineText.translate({0: " ", 0xA0: " "})
+		relOffset = offset - lineStart
+		wordSegFlag = self._getEffectiveWordSegFlag()
+		if wordSegFlag:
+			offsets = WordSegmenter(lineText, self.encoding, wordSegFlag).getSegmentForOffset(
+				relOffset,
+			)
+			if offsets is not None:
+				return (offsets[0] + lineStart, offsets[1] + lineStart)
+		# Fall back to the older word offsets detection that only breaks on non alphanumeric
+		if self.encoding == textUtils.WCHAR_ENCODING:
+			offsetConverter = textUtils.WideStringOffsetConverter(lineText)
+			relStrOffset = offsetConverter.encodedToStrOffsets(relOffset, relOffset)[0]
+			relStrStart = findStartOfWord(lineText, relStrOffset)
+			relStrEnd = findEndOfWord(lineText, relStrOffset)
+			relWideStringStart, relWideStringEnd = offsetConverter.strToEncodedOffsets(relStrStart, relStrEnd)
+			return (relWideStringStart + lineStart, relWideStringEnd + lineStart)
+		start = findStartOfWord(lineText, offset - lineStart) + lineStart
+		end = findEndOfWord(lineText, offset - lineStart) + lineStart
+		return [start, end]
+
+	def _getLineNumFromOffset(self, offset):
+		return None
+
+	def _getLineOffsets(self, offset):
+		text = self._getStoryText()
+		if self.encoding == textUtils.WCHAR_ENCODING:
+			offsetConverter = textUtils.WideStringOffsetConverter(text)
+			strOffset = offsetConverter.encodedToStrOffsets(offset, offset)[0]
+			strStart = findStartOfLine(text, strOffset)
+			strEnd = findEndOfLine(text, strOffset)
+			return offsetConverter.strToEncodedOffsets(strStart, strEnd)
+		elif not (
+			self.encoding is None
+			or self.encoding == "utf_32_le"
+			or self.encoding == textUtils.USER_ANSI_CODE_PAGE
+		):
+			raise NotImplementedError
+		start = findStartOfLine(text, offset)
+		end = findEndOfLine(text, offset)
+		return [start, end]
+
+	def _getSentenceOffsets(self, offset: int) -> tuple[int, int]:
+		"""Gets the start and end offsets of the sentence containing the given offset.
+
+		Sentences are segmented over the containing paragraph (:meth:`_getParagraphOffsets`)
+		using the Windows built-in ICU BreakIterator (UAX#29), so a sentence can span
+		multiple lines.
+
+		:param offset: The offset of the character within the sentence.
+		:return: A tuple of the start and end offsets of the sentence.
+		:raises NotImplementedError: If ICU is unavailable (Windows older than version 1703),
+		    the encoding is neither UTF-16 nor one whose offsets are str indices,
+		    or the ICU call fails.
+		"""
+		if not ICU_AVAILABLE:
+			raise NotImplementedError
+		if self.encoding is not None and self.encoding not in (
+			textUtils.WCHAR_ENCODING,
+			textUtils.USER_ANSI_CODE_PAGE,
+			"utf_32_le",
+		):
+			raise NotImplementedError
+		paragraphStart, paragraphEnd = self._getParagraphOffsets(offset)
+		paragraphText = self._getTextRange(paragraphStart, paragraphEnd)
+		result = icu.calculateOffsetsForEncoding(
+			icu.calculateSentenceOffsets,
+			paragraphText,
+			offset - paragraphStart,
+			self.encoding,
+		)
+		if result is None:
+			raise NotImplementedError
+		return (result[0] + paragraphStart, result[1] + paragraphStart)
+
+	def _getParagraphOffsets(self, offset):
+		return self._getLineOffsets(offset)
+
+	def _getReadingChunkOffsets(self, offset: int) -> tuple[int, int]:
+		"""Gets the start and end offsets of the reading chunk containing the given offset,
+		falling back to the line offsets if the configured unit is not implemented.
+
+		:param offset: The offset of the character within the reading chunk.
+		:return: A tuple of the start and end offsets of the reading chunk.
+		"""
+		unit = self.unit_readingChunk
+		try:
+			return self._getUnitOffsets(unit, offset)
+		except NotImplementedError:
+			return self._getLineOffsets(offset)
+
+	def _getBoundingRectFromOffset(self, offset):
+		raise NotImplementedError
+
+	def _getPointFromOffset(self, offset):
+		# Purposely do not catch LookupError or NotImplementedError raised by _getBoundingRectFromOffset.
+		return self._getBoundingRectFromOffset(offset).center
+
+	def _getOffsetFromPoint(self, x, y):
+		raise NotImplementedError
+
+	def _getNVDAObjectFromOffset(self, offset):
+		return self.obj
+
+	def _getOffsetsFromNVDAObject(self, obj):
+		if obj == self.obj:
+			return 0, self._getStoryLength()
+		raise LookupError
+
+	def __init__(self, obj, position):
+		"""Constructor.
+		Subclasses may extend this to perform implementation specific initialisation, calling their superclass method afterwards.
+		"""
+		super().__init__(obj, position)
+		self.wordSegConf: FeatureFlag = config.conf["documentNavigation"]["wordSegmentationStandard"]
+
+		from NVDAObjects import NVDAObject
+
+		if isinstance(position, locationHelper.Point):
+			offset = self._getOffsetFromPoint(position.x, position.y)
+			position = Offsets(offset, offset)
+		elif isinstance(position, NVDAObject):
+			start, end = self._getOffsetsFromNVDAObject(position)
+			position = textInfos.offsets.Offsets(start, end)
+
+		if type(position) is type(self):
+			# This is a direct TextInfo to TextInfo copy.
+			# Copy over the contents of the property cache, and any private instance variables (includes the TextInfo's offsets)
+			self._propertyCache.update(position._propertyCache)
+			self.__dict__.update(
+				{x: y for x, y in position.__dict__.items() if x.startswith("_") and x != "_propertyCache"},
+			)
+		elif position == textInfos.POSITION_FIRST:
+			self._startOffset = self._endOffset = 0
+		elif position == textInfos.POSITION_LAST:
+			self._startOffset = self._endOffset = max(self._getStoryLength() - 1, 0)
+		elif position == textInfos.POSITION_CARET:
+			self._startOffset = self._endOffset = self._getCaretOffset()
+		elif position == textInfos.POSITION_SELECTION:
+			(self._startOffset, self._endOffset) = self._getSelectionOffsets()
+		elif position == textInfos.POSITION_ALL:
+			self._startOffset = 0
+			self._endOffset = self._getStoryLength()
+		elif isinstance(position, Offsets):
+			self._startOffset = max(min(position.startOffset, self._getStoryLength()), 0)
+			self._endOffset = max(min(position.endOffset, self._getStoryLength()), 0)
+		else:
+			raise NotImplementedError("position: %s not supported" % position)  # noqa: UP031
+
+	def _get_NVDAObjectAtStart(self):
+		return self._getNVDAObjectFromOffset(self._startOffset)
+
+	def _getUnitOffsets(self, unit: str, offset: int) -> tuple[int, int]:
+		"""Gets the start and end offsets of the unit containing the given offset.
+
+		:param unit: Any of UNIT_CHARACTER, UNIT_WORD, UNIT_LINE, UNIT_SENTENCE, UNIT_PARAGRAPH,
+			UNIT_READINGCHUNK, UNIT_STORY, or UNIT_OFFSET as defined in textInfos.
+		:param offset: The offset of the character within the text unit.
+		:return: A tuple of the start and end offsets of the unit.
+		:raises ValueError: If the unit is not recognised.
+		:raises NotImplementedError: If the offset getter for the given unit is not implemented.
+		"""
+		match unit:
+			case textInfos.UNIT_CHARACTER:
+				offsetsFunc = self._getCharacterOffsets
+			case textInfos.UNIT_WORD:
+				offsetsFunc = self._getWordOffsets
+			case textInfos.UNIT_LINE:
+				offsetsFunc = self._getLineOffsets
+			case textInfos.UNIT_SENTENCE:
+				offsetsFunc = self._getSentenceOffsets
+			case textInfos.UNIT_PARAGRAPH:
+				offsetsFunc = self._getParagraphOffsets
+			case textInfos.UNIT_READINGCHUNK:
+				offsetsFunc = self._getReadingChunkOffsets
+			case textInfos.UNIT_STORY:
+				return 0, self._getStoryLength()
+			case textInfos.UNIT_OFFSET:
+				return offset, offset + 1
+			case _:
+				raise ValueError(f"unknown unit: {unit!r}")
+		return offsetsFunc(offset)
+
+	def _get_pointAtStart(self):
+		try:
+			return self._getBoundingRectFromOffset(self._startOffset).topLeft
+		except NotImplementedError:
+			return self._getPointFromOffset(self._startOffset)
+
+	def _get_isCollapsed(self):
+		if self._startOffset == self._endOffset:  # noqa: SIM103
+			return True
+		else:
+			return False
+
+	def collapse(self, end=False):
+		if not end:
+			self._endOffset = self._startOffset
+		else:
+			self._startOffset = self._endOffset
+
+	def expand(self, unit):
+		if unit == textInfos.UNIT_WORD and self.isCollapsed and self._startOffset == self._getStoryLength():
+			try:
+				flowsTo = self.obj.flowsTo
+			except (AttributeError, NotImplementedError):
+				flowsTo = None
+			if not flowsTo:
+				return
+		self._startOffset, self._endOffset = self._getUnitOffsets(unit, self._startOffset)
+
+	def copy(self):
+		return self.__class__(self.obj, self)
+
+	def compareEndPoints(self, other, which):
+		if which == "startToStart":
+			diff = self._startOffset - other._startOffset
+		elif which == "startToEnd":
+			diff = self._startOffset - other._endOffset
+		elif which == "endToStart":
+			diff = self._endOffset - other._startOffset
+		elif which == "endToEnd":
+			diff = self._endOffset - other._endOffset
+		else:
+			raise ValueError("bad argument - which: %s" % which)  # noqa: UP031
+		if diff < 0:
+			diff = -1
+		elif diff > 0:
+			diff = 1
+		return diff
+
+	def setEndPoint(self, other, which):
+		if which == "startToStart":
+			self._startOffset = other._startOffset
+		elif which == "startToEnd":
+			self._startOffset = other._endOffset
+		elif which == "endToStart":
+			self._endOffset = other._startOffset
+		elif which == "endToEnd":
+			self._endOffset = other._endOffset
+		else:
+			raise ValueError("bad argument - which: %s" % which)  # noqa: UP031
+		if self._startOffset > self._endOffset:
+			# start should never be after end.
+			if which in ("startToStart", "startToEnd"):
+				self._endOffset = self._startOffset
+			else:
+				self._startOffset = self._endOffset
+
+	def getTextWithFields(self, formatConfig: dict | None = None) -> textInfos.TextInfo.TextWithFieldsT:
+		if not formatConfig:
+			formatConfig = config.conf["documentFormatting"]
+		if self.detectFormattingAfterCursorMaybeSlow and not formatConfig["detectFormatAfterCursor"]:
+			field, (boundStart, boundEnd) = self._getFormatFieldAndOffsets(
+				self._startOffset,
+				formatConfig,
+				calculateOffsets=False,
+			)
+			text = self.text
+			return [textInfos.FieldCommand("formatChange", field), text]
+		commandList = []
+		offset = self._startOffset
+		while offset < self._endOffset:
+			field, (boundStart, boundEnd) = self._getFormatFieldAndOffsets(offset, formatConfig)
+			if boundEnd <= boundStart:
+				boundEnd = boundStart + 1
+			if boundEnd <= offset:
+				boundEnd = offset + 1
+			command = textInfos.FieldCommand("formatChange", field)
+			commandList.append(command)
+			text = self._getTextRange(offset, min(boundEnd, self._endOffset))
+			commandList.append(text)
+			offset = boundEnd
+		return commandList
+
+	def _get_text(self):
+		return self._getTextRange(self._startOffset, self._endOffset)
+
+	def unitIndex(self, unit):
+		if unit == textInfos.UNIT_LINE:
+			return self._lineNumFromOffset(self._startOffset)
+		else:
+			raise NotImplementedError
+
+	def unitCount(self, unit):
+		if unit == textInfos.UNIT_LINE:
+			return self._getLineCount()
+		else:
+			raise NotImplementedError
+
+	def allowMoveToUnitOffsetPastEnd(self, unit: str) -> bool:
+		"""
+		This method indicates whether the `move` method is allowed to move one unit past the end of the text info.
+		For example, normally we should be able to move 1 past story length
+		to allow braille routing to move to an insertion point at the end. (#2096)
+		Furthermore, review cursor should be able to reach the last, empty line in some controls,
+		like Scintilla. (#18348)
+		:param unit: the TextInfo unit (e.g. character or word)
+		:return: Whether or not to allow movement past end for the specific unit.
+		"""
+		return True
+
+	if NVDAState._allowDeprecatedAPI():
+
+		def _get_allowMoveToOffsetPastEnd(self) -> bool:
+			log.warning(
+				"OffsetsTextInfo.allowMoveToOffsetPastEnd is deprecated. "
+				"Use the OffsetsTextInfo.allowMoveToUnitOffsetPastEnd method instead.",
+				stack_info=True,
+			)
+			return self.allowMoveToUnitOffsetPastEnd(textInfos.UNIT_CHARACTER)
+
+	def move(self, unit, direction, endPoint=None):
+		if direction == 0:
+			return 0
+		if endPoint == "end":
+			offset = self._endOffset
+		elif endPoint == "start":
+			offset = self._startOffset
+		else:
+			self.collapse()
+			offset = self._startOffset
+		lastOffset = None
+		count = 0
+		lowLimit = 0
+		highLimit = self._getStoryLength()
+		if self.allowMoveToUnitOffsetPastEnd(unit):
+			highLimit += 1
+		while (
+			count != direction
+			and (
+				lastOffset is None
+				or (direction > 0 and offset > lastOffset)
+				or (direction < 0 and offset < lastOffset)
+			)
+			and (offset < highLimit or direction < 0)
+			and (offset > lowLimit or direction > 0)
+		):
+			lastOffset = offset
+			if direction < 0 and offset > lowLimit:
+				offset -= 1
+			newStart, newEnd = self._getUnitOffsets(unit, offset)
+			if direction < 0:
+				offset = newStart
+			elif direction > 0:
+				offset = newEnd
+			count = count + 1 if direction > 0 else count - 1
+		if endPoint == "start":
+			if (
+				(direction > 0 and offset <= self._startOffset)
+				or (direction < 0 and offset >= self._startOffset)
+				or offset < lowLimit
+				or offset >= highLimit
+			):
+				return 0
+			self._startOffset = offset
+		elif endPoint == "end":
+			if (
+				(direction > 0 and offset <= self._endOffset)
+				or (direction < 0 and offset >= self._endOffset)
+				or offset < lowLimit
+				or offset > highLimit
+			):
+				return 0
+			self._endOffset = offset
+		else:
+			if (
+				(direction > 0 and offset <= self._startOffset)
+				or (direction < 0 and offset >= self._startOffset)
+				or offset < lowLimit
+				or offset >= highLimit
+			):
+				return 0
+			self._startOffset = self._endOffset = offset
+		if self._startOffset > self._endOffset:
+			tempOffset = self._startOffset
+			self._startOffset = self._endOffset
+			self._endOffset = tempOffset
+		return count
+
+	def find(self, text, caseSensitive=False, reverse=False):
+		if reverse:
+			# When searching in reverse, we reverse both strings and do a forwards search.
+			text = text[::-1]
+			# Start searching one before the start to avoid finding the current match.
+			inText = self._getTextRange(0, self._startOffset)[::-1]
+		else:
+			# Start searching one past the start to avoid finding the current match.
+			inText = self._getTextRange(self._startOffset + 1, self._getStoryLength())
+		m = re.search(re.escape(text), inText, (0 if caseSensitive else re.IGNORECASE) | re.UNICODE)
+		if not m:
+			return False
+		converter = textUtils.getOffsetConverter(self.encoding)(inText)
+		if reverse:
+			offset = self._startOffset - converter.strToEncodedOffsets(m.end())
+		else:
+			offset = self._startOffset + 1 + converter.strToEncodedOffsets(m.start())
+		self._startOffset = self._endOffset = offset
+		return True
+
+	def updateCaret(self):
+		return self._setCaretOffset(self._startOffset)
+
+	def updateSelection(self):
+		return self._setSelectionOffsets(self._startOffset, self._endOffset)
+
+	def _get_bookmark(self):
+		return Offsets(self._startOffset, self._endOffset)
+
+	def _getFirstVisibleOffset(self):
+		obj = self.obj
+		if isinstance(obj, TreeInterceptor):
+			obj = obj.rootNVDAObject
+		if obj.hasIrrelevantLocation:
+			raise LookupError("Object is off screen, invisible or has no location")
+		return self._getOffsetFromPoint(*obj.location.topLeft)
+
+	def _getLastVisibleOffset(self):
+		obj = self.obj
+		if isinstance(obj, TreeInterceptor):
+			obj = obj.rootNVDAObject
+		if obj.hasIrrelevantLocation:
+			raise LookupError("Object is off screen, invisible or has no location")
+		exclusiveX, exclusiveY = obj.location.bottomRight
+		offset = self._getOffsetFromPoint(exclusiveX - 1, exclusiveY - 1)
+		if 0 == offset < self._getStoryLength():
+			raise LookupError("Couldn't get reliable last visible offset")
+		return offset
+
+	def _getOffsetEncoder(self):
+		return textUtils.getOffsetConverter(self.encoding)(self.text)
+
+	def moveToCodepointOffset(
+		self,
+		codepointOffset: int,
+	) -> Self:
+		result = self.copy()
+		encodedOffset = self._startOffset + self._getOffsetEncoder().strToEncodedOffsets(codepointOffset)
+		result._startOffset = result._endOffset = encodedOffset
+		return result

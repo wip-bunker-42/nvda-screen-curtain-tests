@@ -1,0 +1,1200 @@
+# A part of NonVisual Desktop Access (NVDA)
+# Copyright (C) 2011-2026 NV Access Limited, Joseph Lee, Babbage B.V., Łukasz Golonka, Cyrille Bougot, Leonard de Ruijter
+# This file may be used under the terms of the GNU General Public License, version 2 or later, as modified by the NVDA license.
+# For full terms and any additional permissions, see the NVDA license file: https://github.com/nvaccess/nvda/blob/master/copying.txt
+
+import ctypes
+import json
+import os
+import pathlib
+import shutil
+import tempfile
+import time
+import winreg
+from collections.abc import Iterable, Iterator, Sequence
+from enum import Enum, auto
+
+import addonHandler
+import buildVersion
+import COMRegistrationFixes
+import comtypes.client
+import config
+import easeOfAccess
+import fileUtils
+import globalVars
+import languageHandler
+import NVDAState
+import psutil
+import shellapi
+import versionInfo
+import winBindings.kernel32
+import winKernel
+from config.registry import NVDA_ADDON_PROG_ID, RegistryKey, _deleteKeyAndSubkeys
+from logHandler import log
+from NVDAState import WritePaths
+from utils._deprecate import MovedSymbol, RemovedSymbol, handleDeprecations
+from utils.tempFile import _createEmptyTempFileForDeletingFile
+
+_wsh = None
+
+__getattr__ = handleDeprecations(
+	MovedSymbol(
+		"defaultStartMenuFolder",
+		"NVDAState",
+		"WritePaths",
+		"defaultStartMenuFolder",
+	),
+	MovedSymbol(
+		"defaultInstallPath",
+		"NVDAState",
+		"WritePaths",
+		"defaultInstallDir",
+	),
+	RemovedSymbol(
+		"comparePreviousInstall",
+		lambda: _comparePreviousInstall()._legacyValue,
+	),
+)
+
+
+def _getWSH():
+	global _wsh
+	if not _wsh:
+		_wsh = comtypes.client.CreateObject("wScript.Shell", dynamic=True)
+	return _wsh
+
+
+def createShortcut(
+	path: str,
+	targetPath: str | None = None,
+	arguments: str | None = None,
+	iconLocation: str | None = None,
+	workingDirectory: str | None = None,
+	hotkey: str | None = None,
+	prependSpecialFolder: str | None = None,
+):
+	# #7696: The shortcut is only physically saved to disk if it does not already exist, or one or more properties have changed.
+	wsh = _getWSH()
+	if prependSpecialFolder:
+		specialPath = wsh.SpecialFolders(prependSpecialFolder)
+		path = os.path.join(specialPath, path)
+	if not os.path.isdir(os.path.dirname(path)):
+		os.makedirs(os.path.dirname(path))
+	shortcutExists = os.path.isfile(path)
+	short = wsh.CreateShortcut(path)
+	needsSave = not shortcutExists
+	if short.targetPath != targetPath:
+		short.TargetPath = targetPath
+		needsSave = True
+	if arguments and short.arguments != arguments:
+		short.arguments = arguments
+		needsSave = True
+	if not shortcutExists and hotkey:
+		short.Hotkey = hotkey
+		needsSave = True
+	if iconLocation and short.iconLocation != iconLocation:
+		short.IconLocation = iconLocation
+		needsSave = True
+	if workingDirectory and short.workingDirectory != workingDirectory:
+		short.workingDirectory = workingDirectory
+		needsSave = True
+	if needsSave:
+		short.Save()
+
+
+class ComparisonState(Enum):
+	FRESH_INSTALL = auto()
+	DOWNGRADE = auto()
+	REINSTALL = auto()
+	UPGRADE = auto()
+	UNKNOWN = auto()
+
+	@property
+	def _legacyValue(self) -> int | None:
+		"""Legacy value for comparison state."""
+		match self:
+			case ComparisonState.FRESH_INSTALL:
+				return None
+			case ComparisonState.DOWNGRADE:
+				return 1
+			case ComparisonState.REINSTALL:
+				return 0
+			case ComparisonState.UPGRADE:
+				return -1
+			case ComparisonState.UNKNOWN:
+				return None
+
+
+def _comparePreviousInstall() -> ComparisonState:
+	pathX86 = WritePaths._installDirX86
+	pathX86Exists = pathX86 and os.path.isdir(pathX86)
+	pathX64 = WritePaths.installDir
+	pathX64Exists = pathX64 and os.path.isdir(pathX64)
+
+	installPath = None
+	if pathX64Exists:
+		installPath = pathX64
+	elif pathX86Exists:
+		installPath = pathX86
+
+	return _comparePreviousCopy(installPath)
+
+
+def _comparePreviousCopy(previousCopyPath: str | None) -> ComparisonState:
+	"""
+	Compares the version of the currently running NVDA with the version of a previous installation of NVDA on this system, if any.
+	:return:
+		- ComparisonState.FRESH_INSTALL if no previous installation is found
+		- ComparisonState.DOWNGRADE if the previous installation is newer than the current one
+		- ComparisonState.REINSTALL if they are the same version
+		- ComparisonState.UPGRADE if the previous installation is older than the current one
+		- ComparisonState.UNKNOWN if there was an error determining the version of either the current or previous installation
+	"""
+	previousCopyPathExists = previousCopyPath and os.path.isdir(previousCopyPath)
+	if not previousCopyPathExists:
+		return ComparisonState.FRESH_INSTALL
+
+	oldSlavePath = os.path.join(previousCopyPath, "nvda_slave.exe")
+	try:
+		oldVersion = fileUtils.getFileVersionInfo(oldSlavePath, "FileVersion")
+	except (OSError, RuntimeError):
+		log.debug("Unable to get file version of nvda_slave.exe in previous copy.")
+		return ComparisonState.UNKNOWN
+
+	try:
+		newVersion = fileUtils.getFileVersionInfo("nvda_slave.exe", "FileVersion")
+	except (OSError, RuntimeError):
+		# This should never happen.
+		log.exception("Unable to get file version of nvda_slave.exe in current process.")
+		return ComparisonState.UNKNOWN
+
+	try:
+		oldVersion = [int(x) for x in oldVersion["FileVersion"].split(".")]
+		newVersion = [int(x) for x in newVersion["FileVersion"].split(".")]
+	except (KeyError, AttributeError, ValueError, TypeError):
+		log.exception("Error parsing version information.")
+		return ComparisonState.UNKNOWN
+
+	if oldVersion > newVersion:
+		return ComparisonState.DOWNGRADE
+	elif oldVersion < newVersion:
+		return ComparisonState.UPGRADE
+	else:
+		return ComparisonState.REINSTALL
+
+
+def getDocFilePath(fileName: str, installDir: str):
+	rootPath = os.path.join(installDir, "documentation")
+	lang = languageHandler.getLanguage()
+	tryLangs = [lang]
+	if "_" in lang:
+		# This locale has a sub-locale, but documentation might not exist for the sub-locale, so try stripping it.
+		tryLangs.append(lang.split("_")[0])
+	# If all else fails, use English.
+	tryLangs.append("en")
+	fileName, fileExt = os.path.splitext(fileName)  # noqa: RUF059
+	for tryLang in tryLangs:
+		tryDir = os.path.join(rootPath, tryLang)
+		if not os.path.isdir(tryDir):
+			continue
+		tryPath = os.path.join(tryDir, f"{fileName}.html")
+		if os.path.isfile(tryPath):
+			return tryPath
+
+
+def copyProgramFiles(destPath: str):
+	sourcePath = globalVars.appDir
+	detectUserConfig = True
+	for curSourceDir, subDirs, files in os.walk(sourcePath):
+		if detectUserConfig:
+			detectUserConfig = False
+			subDirs[:] = [
+				x for x in subDirs if os.path.basename(x).lower() not in ("userconfig", "systemconfig")
+			]
+		curDestDir = os.path.join(destPath, os.path.relpath(curSourceDir, sourcePath))
+		if not os.path.isdir(curDestDir):
+			os.makedirs(curDestDir)
+		for f in files:
+			# Never copy nvda.exe as one of the other executables will be renamed later
+			if sourcePath == curSourceDir and f.lower() == "nvda.exe":
+				continue
+			sourceFilePath = os.path.join(curSourceDir, f)
+			destFilePath = os.path.join(destPath, os.path.relpath(sourceFilePath, sourcePath))
+			tryCopyFile(sourceFilePath, destFilePath)
+
+
+def copyUserConfig(destPath: str):
+	sourcePath = WritePaths.configDir
+	for curSourceDir, subDirs, files in os.walk(sourcePath):
+		curDestDir = os.path.join(destPath, os.path.relpath(curSourceDir, sourcePath))
+		if not os.path.isdir(curDestDir):
+			os.makedirs(curDestDir)
+		for f in files:
+			sourceFilePath = os.path.join(curSourceDir, f)
+			destFilePath = os.path.join(destPath, os.path.relpath(sourceFilePath, sourcePath))
+			tryCopyFile(sourceFilePath, destFilePath)
+
+
+def removeOldLibFiles(destPath: str, rebootOK: bool = False):
+	"""
+	Removes library files from previous versions of NVDA.
+	:param destPath: The path where NVDA is installed.
+	:param rebootOK: If true then files can be removed on next reboot if trying to do so now fails.
+	"""
+	for topDir in ("lib", "lib64", "libArm64"):
+		currentLibPath = os.path.join(destPath, topDir, buildVersion.version)
+		for parent, subdirs, files in os.walk(os.path.join(destPath, topDir), topdown=False):
+			if os.path.commonpath(
+				[os.path.abspath(parent), os.path.abspath(currentLibPath)],
+			) == os.path.abspath(currentLibPath):
+				# We are in the lib dir for current installation. Don't touch this!
+				log.debug("Skipping current install lib path: %r" % parent)  # noqa: UP031
+				continue
+			for d in subdirs:
+				path = os.path.join(parent, d)
+				if path != currentLibPath:
+					log.debug(f"Removing old lib directory: {path!r}")
+					try:
+						os.rmdir(path)
+					except OSError:
+						log.warning(
+							"Failed to remove a directory no longer needed. "
+							"This can be manually removed after a reboot or the  installer will try"
+							f" removing it again next time. Directory: {path!r}",
+						)
+			for f in files:
+				path = os.path.join(parent, f)
+				log.debug("Removing old lib file: %r" % path)  # noqa: UP031
+				try:
+					tryRemoveFile(path, numRetries=2, rebootOK=rebootOK)
+				except RetriableFailure:
+					log.warning(
+						"A file no longer needed could not be removed. This can be manually removed after a reboot, or  the installer will try again next time. File: %r"  # noqa: UP031
+						% path,
+					)
+
+
+def removeOldProgramFiles(destPath: str):
+	# #3181: Remove espeak-ng-data\voices except for variants.
+	# Otherwise, there will be duplicates if voices have been moved in this new eSpeak version.
+	root = os.path.join(destPath, "synthDrivers", "espeak-ng-data", "voices")
+	try:
+		files = set(os.listdir(root))
+	except OSError:
+		pass
+	else:
+		# Don't remove variants.
+		files.discard("!v")
+		for fn in files:
+			fn = os.path.join(root, fn)
+			# No need to use tryRemoveFile here because these files should never be locked.
+			# TODO: should we use tryRemoveFile anyway here?
+			if os.path.isdir(fn):
+				shutil.rmtree(fn)
+			else:
+				os.remove(fn)
+
+	# #9960: If compiled python files from older versions aren't removed correctly,
+	# this could cause strange errors when Python tries to create tracebacks
+	# in a newer version of NVDA.
+	#  However don't touch user and system config.
+	#  Also remove old .dll and .manifest files.
+	for curDestDir, subDirs, files in os.walk(destPath):
+		if curDestDir == destPath:
+			subDirs[:] = [
+				x
+				for x in subDirs
+				if os.path.basename(x).lower()
+				not in (
+					"userconfig",
+					"systemconfig",
+					#  Do not remove old libraries here. It is done by removeOldLibFiles.
+					"lib",
+					"lib64",
+					"libarm64",
+				)
+			]
+		for f in files:
+			if f.endswith((".pyc", ".pyo", ".pyd", ".dll", ".manifest")):
+				path = os.path.join(curDestDir, f)
+				log.debug(f"Removing old byte compiled python file: {path!r}")
+				try:
+					tryRemoveFile(path)
+				except RetriableFailure:
+					log.warning(f"Couldn't remove file: {path!r}")
+
+
+def getUninstallerRegInfo(installDir: str) -> dict[str, str | int]:
+	"""
+	Constructs a dictionary that is written to the registry for NVDA to show up
+	in the Windows "Apps and Features" overview.
+	"""
+	return dict(  # noqa: C408
+		DisplayName=f"{buildVersion.name} {buildVersion.version}",
+		DisplayVersion=buildVersion.version_detailed,
+		DisplayIcon=os.path.join(installDir, "images", "nvda.ico"),
+		# EstimatedSize is in KiB
+		EstimatedSize=getDirectorySize(installDir) // 1024,
+		InstallDir=installDir,
+		Publisher=buildVersion.publisher,
+		UninstallDirectory=installDir,
+		UninstallString=os.path.join(installDir, "uninstall.exe"),
+		URLInfoAbout=buildVersion.url,
+	)
+
+
+def getDirectorySize(path: str) -> int:
+	"""Calculates the size of a directory in bytes."""
+	total = 0
+	with os.scandir(path) as iterator:
+		for entry in iterator:
+			if entry.is_file():
+				total += entry.stat().st_size
+			elif entry.is_dir():
+				total += getDirectorySize(entry.path)
+	return total
+
+
+def registerInstallation(
+	installDir: str,
+	startMenuFolder: str,
+	shouldCreateDesktopShortcut: bool,
+	startOnLogonScreen: bool,
+	configInLocalAppData: bool = False,
+) -> None:
+	calculatedUninstallerRegInfo = getUninstallerRegInfo(installDir)
+	log.debug(f"Estimated install size: {calculatedUninstallerRegInfo.get('EstimatedSize')} KiB")
+	with winreg.CreateKeyEx(
+		winreg.HKEY_LOCAL_MACHINE,
+		RegistryKey.INSTALLED_COPY.value,
+		0,
+		winreg.KEY_WRITE,
+	) as k:
+		for name, value in calculatedUninstallerRegInfo.items():
+			if isinstance(value, int):
+				regType = winreg.REG_DWORD
+			elif isinstance(value, str):
+				regType = winreg.REG_SZ
+			else:
+				raise NotImplementedError("Unexpected value from dictionary in getUninstallerRegInfo")
+			winreg.SetValueEx(
+				k,
+				name,
+				None,
+				regType,
+				value,
+			)
+	with winreg.CreateKeyEx(
+		winreg.HKEY_LOCAL_MACHINE,
+		RegistryKey.APP_PATH.value,
+		0,
+		winreg.KEY_WRITE,
+	) as k:
+		winreg.SetValueEx(k, "", None, winreg.REG_SZ, os.path.join(installDir, "nvda.exe"))
+	with winreg.CreateKeyEx(
+		winreg.HKEY_LOCAL_MACHINE,
+		RegistryKey.NVDA.value,
+		0,
+		winreg.KEY_WRITE,
+	) as k:
+		winreg.SetValueEx(k, "startMenuFolder", None, winreg.REG_SZ, startMenuFolder)
+		if configInLocalAppData:
+			winreg.SetValueEx(
+				k,
+				RegistryKey.CONFIG_IN_LOCAL_APPDATA_SUBKEY.value,
+				None,
+				winreg.REG_DWORD,
+				int(configInLocalAppData),
+			)
+		if NVDAState._forceSecureModeEnabled():
+			winreg.SetValueEx(
+				k,
+				RegistryKey.FORCE_SECURE_MODE_SUBKEY.value,
+				None,
+				winreg.REG_DWORD,
+				1,
+			)
+	registerEaseOfAccess(installDir)
+	if startOnLogonScreen is not None:
+		config._setStartOnLogonScreen(startOnLogonScreen)
+	NVDAExe = os.path.join(installDir, "nvda.exe")
+	slaveExe = os.path.join(installDir, "nvda_slave.exe")
+	try:
+		_updateShortcuts(NVDAExe, installDir, shouldCreateDesktopShortcut, slaveExe, startMenuFolder)
+	except Exception:
+		log.error("Error while creating shortcuts", exc_info=True)  # noqa: G201
+	registerAddonFileAssociation(slaveExe)
+
+
+def _createShortcutWithFallback(
+	path: str,
+	targetPath: str | None = None,
+	arguments: str | None = None,
+	iconLocation: str | None = None,
+	workingDirectory: str | None = None,
+	hotkey: str | None = None,
+	prependSpecialFolder: str | None = None,
+	fallbackHotkey: str | None = None,
+	fallbackPath: str | None = None,
+):
+	"""Sometimes translations are used (for `path` or `hotkey` arguments) which include unicode characters
+	which cause the createShortcut method to fail. In these cases, try again using the English string if it is
+	provided via the `fallbackHotkey` / `fallbackPath` arguments.
+	"""
+	try:
+		createShortcut(
+			path,
+			targetPath,
+			arguments,
+			iconLocation,
+			workingDirectory,
+			hotkey,
+			prependSpecialFolder,
+		)
+	except Exception:  # noqa: BLE001
+		if hotkey is not None and fallbackHotkey is not None:
+			log.error(
+				f"Error creating {path}. With hotkey ({hotkey}). Trying fallback hotkey: {fallbackHotkey}",
+			)
+			_createShortcutWithFallback(
+				hotkey=fallbackHotkey,
+				fallbackHotkey=None,
+				path=path,
+				fallbackPath=fallbackPath,
+				targetPath=targetPath,
+				arguments=arguments,
+				prependSpecialFolder=prependSpecialFolder,
+			)
+		elif fallbackPath is not None:
+			log.error(
+				f"Error creating {path}. Trying without translation of filename, instead using: {fallbackPath}",
+			)
+			_createShortcutWithFallback(
+				path=fallbackPath,
+				fallbackPath=None,
+				targetPath=targetPath,
+				arguments=arguments,
+				hotkey=hotkey,
+				prependSpecialFolder=prependSpecialFolder,
+				fallbackHotkey=fallbackHotkey,
+			)
+		else:
+			log.error(
+				f"Error creating {path}, no mitigation possible. "
+				f"Perhaps controlled folder access is active for this directory.",
+			)
+
+
+def _updateShortcuts(
+	NVDAExe: str,
+	installDir: str,
+	shouldCreateDesktopShortcut: bool,
+	slaveExe: str,
+	startMenuFolder: str,
+) -> None:
+	if shouldCreateDesktopShortcut:
+		# Translators: The shortcut key used to start NVDA.
+		# This should normally be left as is, but might be changed for some locales
+		# if the default key causes problems for the normal locale keyboard layout.
+		# The key must be formatted as described in this article:
+		# http://msdn.microsoft.com/en-us/library/3zb1shc6%28v=vs.84%29.aspx
+		hotkeyTranslated = _("CTRL+ALT+N")
+
+		# #8320: -r|--replace is now the default. Nevertheless, keep creating
+		# the shortcut with the now superfluous argument in case a downgrade of
+		# NVDA is later performed.
+		_createShortcutWithFallback(
+			path="NVDA.lnk",
+			targetPath=slaveExe,
+			arguments="launchNVDA -r",
+			hotkey=hotkeyTranslated,
+			fallbackHotkey="CTRL+ALT+N",
+			workingDirectory=installDir,
+			prependSpecialFolder="AllUsersDesktop",
+		)
+
+	_createShortcutWithFallback(
+		path=os.path.join(startMenuFolder, "NVDA.lnk"),
+		targetPath=NVDAExe,
+		workingDirectory=installDir,
+		prependSpecialFolder="AllUsersPrograms",
+	)
+
+	# Translators: A label for a shortcut in start menu and a menu entry in NVDA menu (to go to NVDA website).
+	webSiteTranslated = _("NVDA web site")
+	_createShortcutWithFallback(
+		path=os.path.join(startMenuFolder, webSiteTranslated + ".lnk"),
+		fallbackPath=os.path.join(startMenuFolder, "NVDA web site.lnk"),
+		targetPath=buildVersion.url,
+		prependSpecialFolder="AllUsersPrograms",
+	)
+
+	# Translators: A label for a shortcut item in start menu to uninstall NVDA from the computer.
+	uninstallTranslated = _("Uninstall NVDA")
+	_createShortcutWithFallback(
+		path=os.path.join(startMenuFolder, uninstallTranslated + ".lnk"),
+		fallbackPath=os.path.join(startMenuFolder, "Uninstall NVDA.lnk"),
+		targetPath=os.path.join(installDir, "uninstall.exe"),
+		workingDirectory=installDir,
+		prependSpecialFolder="AllUsersPrograms",
+	)
+
+	# Translators: A label for a shortcut item in start menu to open current user's NVDA configuration directory.
+	exploreConfDirTranslated = _("Explore NVDA user configuration directory")
+	_createShortcutWithFallback(
+		path=os.path.join(startMenuFolder, exploreConfDirTranslated + ".lnk"),
+		fallbackPath=os.path.join(startMenuFolder, "Explore NVDA user configuration directory.lnk"),
+		targetPath=slaveExe,
+		arguments="explore_userConfigPath",
+		workingDirectory=installDir,
+		prependSpecialFolder="AllUsersPrograms",
+	)
+
+	# Translators: The label of the NVDA Documentation menu in the Start Menu.
+	docFolder = os.path.join(startMenuFolder, _("Documentation"))
+
+	# Translators: The label of the Start Menu item to open the Commands Quick Reference document.
+	commandsRefTranslated = _("Commands Quick Reference")
+	_createShortcutWithFallback(
+		path=os.path.join(docFolder, commandsRefTranslated + ".lnk"),
+		fallbackPath=os.path.join(docFolder, "Commands Quick Reference.lnk"),
+		targetPath=getDocFilePath("keyCommands.html", installDir),
+		prependSpecialFolder="AllUsersPrograms",
+	)
+
+	# Translators: A label for a shortcut in start menu to open NVDA user guide.
+	userGuideTranslated = _("User Guide")
+	_createShortcutWithFallback(
+		path=os.path.join(docFolder, userGuideTranslated + ".lnk"),
+		fallbackPath=os.path.join(docFolder, "User Guide.lnk"),
+		targetPath=getDocFilePath("userGuide.html", installDir),
+		prependSpecialFolder="AllUsersPrograms",
+	)
+
+	# Translators: A label for a shortcut in start menu to open NVDA what's new.
+	changesTranslated = _("What's new")
+	_createShortcutWithFallback(
+		path=os.path.join(docFolder, changesTranslated + ".lnk"),
+		fallbackPath=os.path.join(docFolder, "What's new.lnk"),
+		targetPath=getDocFilePath("changes.html", installDir),
+		prependSpecialFolder="AllUsersPrograms",
+	)
+
+
+def isDesktopShortcutInstalled():
+	wsh = _getWSH()
+	specialPath = wsh.SpecialFolders("allUsersDesktop")
+	shortcutPath = os.path.join(specialPath, "nvda.lnk")
+	return os.path.isfile(shortcutPath)
+
+
+def _unregisterEaseOfAccessApp():
+	try:
+		winreg.DeleteKeyEx(
+			winreg.HKEY_LOCAL_MACHINE,
+			RegistryKey.EASE_OF_ACCESS_APP.value,
+			# TODO: remove when NVDA is 64-bit only.
+			access=winreg.KEY_WOW64_64KEY,
+		)
+	except OSError:
+		log.debug("Ease of Access app key not found. Nothing to unregister.")
+	try:
+		easeOfAccess.setAutoStart(easeOfAccess.AutoStartContext.ON_LOGON_SCREEN, False)
+	except (OSError, TypeError):
+		log.debug("Could not disable auto start on logon screen.")
+
+
+def _unregisterDesktopShortcut(keepDesktopShortcut: bool):
+	wsh = _getWSH()
+	desktopPath = os.path.join(wsh.SpecialFolders("AllUsersDesktop"), "NVDA.lnk")
+	if not keepDesktopShortcut and os.path.isfile(desktopPath):
+		try:
+			os.remove(desktopPath)
+		except OSError:
+			pass
+
+
+def _unregisterFromStartMenu() -> None:
+	wsh = _getWSH()
+	programsPath = wsh.SpecialFolders("AllUsersPrograms")
+	startMenuFolder = WritePaths.startMenuFolder
+	if startMenuFolder is None:
+		startMenuFolder = WritePaths.defaultStartMenuFolder
+	startMenuPath = os.path.join(programsPath, startMenuFolder)
+	if os.path.isdir(startMenuPath):
+		shutil.rmtree(startMenuPath, ignore_errors=True)
+		log.debug(f"Removed start menu folder: {startMenuPath}")
+	# Also remove the x86 start menu folder if it is different.
+	startMenuFolderX86 = WritePaths._startMenuFolderX86
+	if startMenuFolderX86 is None:
+		startMenuFolderX86 = WritePaths.defaultStartMenuFolder
+	startMenuPathX86 = os.path.join(programsPath, startMenuFolderX86)
+	if os.path.isdir(startMenuPathX86):
+		shutil.rmtree(startMenuPathX86, ignore_errors=True)
+		log.debug(f"Removed start menu (x86) folder: {startMenuPathX86}")
+
+
+def _unregisterFromUninstallRegistry() -> None:
+	try:
+		winreg.DeleteKeyEx(
+			winreg.HKEY_LOCAL_MACHINE,
+			RegistryKey.INSTALLED_COPY.value,
+			# TODO: remove when NVDA is 64-bit only.
+			access=winreg.KEY_WOW64_64KEY,
+		)
+	except OSError:
+		log.debug("Uninstall registry key not found for 64-bit, nothing to unregister.")
+	try:
+		winreg.DeleteKeyEx(
+			winreg.HKEY_LOCAL_MACHINE,
+			RegistryKey.INSTALLED_COPY.value,
+			access=winreg.KEY_WOW64_32KEY,
+		)
+	except OSError:
+		log.debug("Uninstall registry key not found for 32-bit, nothing to unregister.")
+
+
+def _unregisterFromAppPathRegistry() -> None:
+	try:
+		winreg.DeleteKeyEx(
+			winreg.HKEY_LOCAL_MACHINE,
+			RegistryKey.APP_PATH.value,
+			# TODO: remove when NVDA is 64-bit only.
+			access=winreg.KEY_WOW64_64KEY,
+		)
+	except OSError:
+		log.debug("App path registry key not found for 64-bit, nothing to unregister.")
+	try:
+		winreg.DeleteKeyEx(
+			winreg.HKEY_LOCAL_MACHINE,
+			RegistryKey.APP_PATH.value,
+			access=winreg.KEY_WOW64_32KEY,
+		)
+	except OSError:
+		log.debug("App path registry key not found for 32-bit, nothing to unregister.")
+
+
+def _unregisterFromSoftwareRegistry() -> None:
+	try:
+		winreg.DeleteKeyEx(
+			winreg.HKEY_LOCAL_MACHINE,
+			RegistryKey.NVDA.value,
+			# TODO: remove when NVDA is 64-bit only.
+			access=winreg.KEY_WOW64_64KEY,
+		)
+	except OSError:
+		log.debug("NVDA registry key not found for 64-bit, nothing to unregister.")
+	try:
+		winreg.DeleteKeyEx(
+			winreg.HKEY_LOCAL_MACHINE,
+			RegistryKey.NVDA.value,
+			access=winreg.KEY_WOW64_32KEY,
+		)
+	except OSError:
+		log.debug("NVDA registry key not found for 32-bit, nothing to unregister.")
+
+
+def unregisterInstallation(keepDesktopShortcut: bool = False) -> None:
+	_unregisterEaseOfAccessApp()
+	_unregisterDesktopShortcut(keepDesktopShortcut)
+	_unregisterFromStartMenu()
+	_unregisterFromUninstallRegistry()
+	_unregisterFromAppPathRegistry()
+	_unregisterFromSoftwareRegistry()
+	unregisterAddonFileAssociation()
+
+
+def registerAddonFileAssociation(slaveExe: str):
+	try:
+		# Create progID for NVDA ad-ons
+		with winreg.CreateKeyEx(
+			winreg.HKEY_LOCAL_MACHINE,
+			RegistryKey.ADDON_PROG.value,
+			0,
+			winreg.KEY_WRITE,
+		) as k:
+			# Translators: A file extension label for NVDA add-on package.
+			winreg.SetValueEx(k, None, 0, winreg.REG_SZ, _("NVDA add-on package"))
+			with winreg.CreateKeyEx(k, "DefaultIcon", 0, winreg.KEY_WRITE) as k2:
+				winreg.SetValueEx(k2, None, 0, winreg.REG_SZ, f"@{slaveExe},1")
+			# Point the open verb to nvda_slave addons_installAddonPackage action
+			with winreg.CreateKeyEx(k, "shell\\open\\command", 0, winreg.KEY_WRITE) as k2:
+				winreg.SetValueEx(
+					k2,
+					None,
+					0,
+					winreg.REG_SZ,
+					f'"{slaveExe}" addons_installAddonPackage "%1"',
+				)
+		# Now associate addon extension to the created prog id.
+		with winreg.CreateKeyEx(
+			winreg.HKEY_LOCAL_MACHINE,
+			RegistryKey.ADDON_EXT.value,
+			0,
+			winreg.KEY_WRITE,
+		) as k:
+			winreg.SetValueEx(k, None, 0, winreg.REG_SZ, NVDA_ADDON_PROG_ID)
+			winreg.SetValueEx(k, "Content Type", 0, winreg.REG_SZ, addonHandler.BUNDLE_MIMETYPE)
+			# Add NVDA to the "open With" list
+			k2 = winreg.CreateKeyEx(
+				k,
+				os.path.join("OpenWithProgids", NVDA_ADDON_PROG_ID),
+				0,
+				winreg.KEY_WRITE,
+			)
+			winreg.CloseKey(k2)
+		# Notify the shell that a file association has changed:
+		shellapi.SHChangeNotify(shellapi.SHCNE_ASSOCCHANGED, shellapi.SHCNF_IDLIST, None, None)
+	except OSError:
+		log.error("Can not create addon file association.", exc_info=True)  # noqa: G201
+
+
+def unregisterAddonFileAssociation() -> None:
+	shouldNotifyShell = False
+	try:
+		# As per MSDN recomendation, we only need to remove the prog ID.
+		_deleteKeyAndSubkeys(
+			winreg.HKEY_LOCAL_MACHINE,
+			RegistryKey.ADDON_PROG.value,
+			# TODO: remove when NVDA is 64-bit only.
+			access=winreg.KEY_WOW64_64KEY,
+		)
+	except OSError:
+		log.debug("Addon prog ID registry key not found for 64-bit, nothing to unregister.")
+	else:
+		shouldNotifyShell = True
+	try:
+		_deleteKeyAndSubkeys(
+			winreg.HKEY_LOCAL_MACHINE,
+			RegistryKey.ADDON_PROG.value,
+			access=winreg.KEY_WOW64_32KEY,
+		)
+	except OSError:
+		log.debug("Addon prog ID registry key not found for 32-bit, nothing to unregister.")
+	else:
+		shouldNotifyShell = True
+	if shouldNotifyShell:
+		# Notify the shell that a file association has changed:
+		shellapi.SHChangeNotify(shellapi.SHCNE_ASSOCCHANGED, shellapi.SHCNF_IDLIST, None, None)
+
+
+class RetriableFailure(Exception):
+	pass
+
+
+def tryRemoveFile(
+	path: str,
+	numRetries: int = 6,
+	retryInterval: float = 0.5,
+	rebootOK: bool = False,
+):
+	dirPath = os.path.dirname(path)
+	tempPath = _createEmptyTempFileForDeletingFile(dir=dirPath)
+	try:
+		os.replace(path, tempPath)
+	except OSError:
+		raise RetriableFailure("Failed to rename file %s before  remove" % path)  # noqa: UP031
+	for count in range(numRetries):
+		try:
+			if os.path.isdir(tempPath):
+				shutil.rmtree(tempPath)
+			else:
+				os.remove(tempPath)
+			return
+		except OSError:
+			log.debugWarning(f"Failed to delete file {tempPath}, attempt {count}/{numRetries}", exc_info=True)
+		time.sleep(retryInterval)
+	if rebootOK:
+		log.debugWarning("Failed to delete file %s, marking for delete on reboot" % tempPath)  # noqa: UP031
+		try:
+			# Use escapes in a unicode string instead of raw.
+			# In a raw string the trailing slash escapes the closing quote leading to a python syntax error.
+			pathQualifier = "\\\\?\\"
+			# #9847: Move file to None to delete it.
+			winKernel.moveFileEx(pathQualifier + tempPath, None, winKernel.MOVEFILE_DELAY_UNTIL_REBOOT)
+		except OSError:
+			log.debugWarning(f"Failed to mark file {tempPath} for delete on reboot", exc_info=True)
+		else:
+			return
+	try:
+		os.replace(tempPath, path)
+	except Exception:
+		log.exception(f"Unable to rename back to {path} before retriable failure")
+	raise RetriableFailure("File %s could not be removed" % path)  # noqa: UP031
+
+
+def tryCopyFile(sourceFilePath: str, destFilePath: str):
+	if not sourceFilePath.startswith("\\\\"):
+		sourceFilePath = "\\\\?\\" + sourceFilePath
+	if not destFilePath.startswith("\\\\"):
+		destFilePath = "\\\\?\\" + destFilePath
+	if winBindings.kernel32.CopyFile(sourceFilePath, destFilePath, False) == 0:
+		errorCode = ctypes.GetLastError()
+		log.debugWarning("Unable to copy %s, error %d" % (sourceFilePath, errorCode))  # noqa: UP031
+		if not os.path.exists(destFilePath):
+			raise OSError("error %d copying %s to %s" % (errorCode, sourceFilePath, destFilePath))  # noqa: UP031
+		tempPath = _createEmptyTempFileForDeletingFile(dir=os.path.dirname(destFilePath))
+		try:
+			os.replace(destFilePath, tempPath)
+		except OSError:
+			log.error("Failed to rename %s after failed overwrite" % destFilePath, exc_info=True)  # noqa: G201, UP031
+			raise RetriableFailure("Failed to rename %s after failed overwrite" % destFilePath)  # noqa: UP031
+		winKernel.moveFileEx(tempPath, None, winKernel.MOVEFILE_DELAY_UNTIL_REBOOT)
+		if winBindings.kernel32.CopyFile(sourceFilePath, destFilePath, False) == 0:
+			errorCode = ctypes.GetLastError()
+			raise OSError(
+				"Unable to copy file %s to %s, error %d" % (sourceFilePath, destFilePath, errorCode),  # noqa: UP031
+			)
+
+
+_nvdaExes = {
+	"nvda.exe",
+	"nvda_noUIAccess.exe",
+	"nvda_uiAccess.exe",
+	"nvda_dmp.exe",
+	"nvda_slave.exe",
+}
+
+
+def _getInstallDirs() -> list[str]:
+	"""Get the folders an installation replaces the NVDA executables in.
+
+	:return: The install folder, followed by the legacy x86 install folder when it exists separately.
+	"""
+	installDir = WritePaths.defaultInstallDir
+	installDirX86 = WritePaths._installDirX86 or WritePaths._defaultInstallDirX86
+	dirs = [installDir]
+	if installDirX86 is not None and os.path.isdir(installDirX86) and installDirX86 != installDir:
+		dirs.append(installDirX86)
+	return dirs
+
+
+def _getRunningNVDAProcesses(installDirs: Sequence[str]) -> Iterator[psutil.Process]:
+	"""Find the processes running one of the NVDA executables from the install folders.
+	Processes in every session and of every user are included, as is any other copy of NVDA.
+	The current process is never included.
+	This needs no elevation.
+
+	:param installDirs: The folders to look in.
+	:return: An iterator over the processes found.
+	"""
+	exeNames = {os.path.normcase(exe) for exe in _nvdaExes}
+	exePaths = {
+		os.path.normcase(os.path.join(installDir, exe)) for installDir in installDirs for exe in _nvdaExes
+	}
+	for process in psutil.process_iter(["exe"]):
+		imagePath = process.info["exe"]
+		if process.pid == os.getpid() or not imagePath:
+			continue
+		normalizedPath = os.path.normcase(imagePath)
+		if normalizedPath in exePaths:
+			yield process
+		elif os.path.basename(normalizedPath) in exeNames:
+			log.debug(f"Ignoring {imagePath}, it is outside the install folders")
+
+
+def _waitForRunningNVDAProcesses(installDirs: Sequence[str], timeout: float = 3.0) -> list[psutil.Process]:
+	"""Wait for the processes found by :func:`_getRunningNVDAProcesses` to exit.
+	It polls whether the processes still run and needs no access to them.
+
+	:param installDirs: The folders to look in.
+	:param timeout: The maximum number of seconds to wait.
+	:return: The processes that are still running after the wait.
+	"""
+	processes = list(_getRunningNVDAProcesses(installDirs))
+	deadline = time.monotonic() + timeout
+	while True:
+		processes = [process for process in processes if process.is_running()]
+		if not processes or time.monotonic() >= deadline:
+			return processes
+		time.sleep(0.1)
+
+
+def _terminateProcesses(processes: Iterable[psutil.Process]) -> None:
+	"""Forcefully end processes.
+	This needs elevation to end processes of other users.
+	Failures are logged and do not stop the remaining processes from being terminated.
+
+	:param processes: The processes to end, as returned by :func:`psutil.process_iter` with the ``exe`` attribute.
+	"""
+	terminated: list[psutil.Process] = []
+	for process in processes:
+		log.info(f"Terminating process {process.pid} ({process.info['exe']})")
+		try:
+			process.kill()
+		except psutil.Error:
+			log.warning(f"Failed to terminate process {process.pid} ({process.info['exe']})", exc_info=True)
+		else:
+			terminated.append(process)
+	_gone, alive = psutil.wait_procs(terminated, timeout=2)
+	for process in alive:
+		log.warning(
+			f"Process {process.pid} ({process.info['exe']}) did not exit within 2 seconds of being terminated",
+		)
+
+
+def _revertGroupDelete(tempDir: str, installDir: str):
+	"""Move all files in tempDir back to installDir, retaining the same relative path"""
+	for tempFile in pathlib.Path(tempDir).rglob("*"):
+		relativePath = tempFile.relative_to(tempDir)
+		originalPath = os.path.join(installDir, relativePath.as_posix())
+		try:
+			os.replace(tempFile.absolute(), originalPath)
+		except OSError:
+			log.exception(f"Failed to rename {tempFile} back to {originalPath}")
+
+
+def _deleteFileGroupOrFail(
+	installDir: str,
+	relativeFilepaths: Iterable[str],
+	numTries: int = 6,
+	retryWaitInterval: float = 0.5,
+):
+	"""
+	Delete a group of files in the installer folder.
+	Each file tries to be deleted up to `numTries` times,
+	with a wait of `retryWaitInterval` seconds between each attempt.
+	If all tries to delete a file fail, revert the deletion of all other files.
+
+	:param installDir: an iterable of file paths relative to installDir
+	:param relativeFilepaths: an iterable of file paths relative to installDir
+
+	:raises RetriableFailure: if the files fail to be deleted.
+	"""
+	tempDir = tempfile.mkdtemp()
+	try:
+		for filepath in relativeFilepaths:
+			originalPath = os.path.join(installDir, filepath)
+			if not pathlib.Path(originalPath).exists():
+				log.debug(f"Skipping remove for non-existent file: {originalPath}")
+				continue
+			tempPath = os.path.join(tempDir, filepath)
+			pathlib.Path(tempPath).parent.mkdir(parents=True, exist_ok=True)
+			shutil.copyfile(originalPath, tempPath)
+			for count in range(1, numTries + 1):
+				if count > 1:
+					time.sleep(retryWaitInterval)
+				try:
+					os.remove(originalPath)
+				except OSError as e:
+					log.warning(f"Failed to delete file {originalPath}: {e}, attempt {count}/{numTries}")
+				else:
+					log.debug(f"Deleted {originalPath}")
+					break
+			else:
+				# If the file failed to be deleted, revert the deletion of all other files
+				# and raise a RetriableFailure.
+
+				# Delete this specific copied file as the remove failed.
+				os.remove(tempPath)
+				log.error(f"Failed to move {originalPath} to {tempPath}")
+				_revertGroupDelete(tempDir, installDir)
+				raise RetriableFailure("Failed to move files to temp directory for deletion")
+	finally:
+		try:
+			shutil.rmtree(tempDir)
+		except OSError:
+			# Ignore this failure, as the temp directory should get deleted eventually
+			log.debugWarning(f"Failed to remove temp directory {tempDir}", exc_info=True)
+
+
+def install(
+	shouldCreateDesktopShortcut: bool = True,
+	shouldRunAtLogon: bool = True,
+	shouldTerminateRunningNVDA: bool = False,
+) -> None:
+	"""Install NVDA.
+
+	:param shouldCreateDesktopShortcut: Whether to create a desktop shortcut.
+	:param shouldRunAtLogon: Whether NVDA starts at logon.
+	:param shouldTerminateRunningNVDA: Whether to end the running NVDA processes in the install folders
+		before their executables are deleted.
+	"""
+	prevInstallPath = WritePaths.installDir
+	installDirs = _getInstallDirs()
+	installDir = installDirs[0]
+	shouldCleanX86 = len(installDirs) > 1
+	installDirX86 = installDirs[1] if shouldCleanX86 else None
+	startMenuFolder = WritePaths.defaultStartMenuFolder
+	runningProcesses = _waitForRunningNVDAProcesses(installDirs, timeout=1)
+	if shouldTerminateRunningNVDA:
+		_terminateProcesses(runningProcesses)
+
+	# Remove all the main executables always.
+	# We do this for two reasons:
+	# 1. If this fails, it means another copy of NVDA is running elsewhere,
+	# so we shouldn't proceed.
+	# 2. The appropriate executable for nvda.exe will be determined by
+	# which executables exist after copying program files.
+	# Some exes are no longer used, but we remove them anyway from legacy copies.
+	# nvda_service.exe was removed in 2017.4 (#7625).
+	# nvda_eoaProxy.exe existed to support Windows 7 Ease of Access, and was removed in 2024.1 (#15577).
+	_deleteFileGroupOrFail(
+		installDir,
+		_nvdaExes.union({"nvda_service.exe", "nvda_eoaProxy.exe"}),
+		numTries=6,
+		retryWaitInterval=0.5,
+	)
+	if shouldCleanX86:
+		_deleteFileGroupOrFail(
+			installDirX86,
+			_nvdaExes.union({"nvda_service.exe", "nvda_eoaProxy.exe"}),
+			numTries=6,
+			retryWaitInterval=0.5,
+		)
+	unregisterInstallation(keepDesktopShortcut=shouldCreateDesktopShortcut)
+	if prevInstallPath:
+		removeOldLoggedFiles(prevInstallPath)
+	removeOldProgramFiles(installDir)
+	if shouldCleanX86:
+		removeOldProgramFiles(installDirX86)
+	copyProgramFiles(installDir)
+	for f in ("nvda_UIAccess.exe", "nvda_noUIAccess.exe"):
+		f = os.path.join(installDir, f)
+		if os.path.isfile(f):
+			tryCopyFile(f, os.path.join(installDir, "nvda.exe"))
+			break
+	else:
+		raise RuntimeError("No available executable to use as nvda.exe")
+	removeOldLibFiles(installDir, rebootOK=True)
+	if shouldCleanX86:
+		removeOldLibFiles(installDirX86, rebootOK=True)
+	registerInstallation(
+		installDir,
+		startMenuFolder,
+		shouldCreateDesktopShortcut,
+		shouldRunAtLogon,
+		NVDAState._configInLocalAppDataEnabled(),
+	)
+	if shouldCleanX86:
+		oldSystemConfigPath = os.path.join(installDirX86, "systemConfig")
+		if os.path.isdir(oldSystemConfigPath):
+			config._setSystemConfig(oldSystemConfigPath, prefix=installDir, isMigration=True)
+		tryRemoveFile(installDirX86, rebootOK=True)
+	_migratePickledAddonsStateToJson(os.path.join(installDir, "systemConfig"))
+	COMRegistrationFixes.fixCOMRegistrations()
+
+
+def removeOldLoggedFiles(installPath: str):
+	datPath = os.path.join(installPath, "uninstall.dat")
+	lines = []
+	if os.path.isfile(datPath):
+		with open(datPath, "r") as datFile:
+			datFile.readline()
+			lines = datFile.readlines()
+			lines.append(os.path.join(installPath, "uninstall.exe"))
+			lines.sort(reverse=True)
+			lines.append(os.path.join(installPath, "uninstall.dat"))
+	for line in lines:
+		filePath = line.rstrip("\n")
+		if os.path.exists(filePath):
+			tryRemoveFile(filePath, rebootOK=True)
+
+
+def _migratePickledAddonsStateToJson(configPath: str) -> None:
+	pickledPath = os.path.join(configPath, addonHandler._OLD_STATE_FILENAME)
+	if not os.path.isfile(pickledPath):
+		log.debug("Pickled add-ons state does not exist. No migration necessary.")
+		return
+	try:
+		# Only import if absolutely necessary.
+		from addonHandler._pickleToJsonMigration import _getAddonsStateDictFromPickle
+
+		jsonState = _getAddonsStateDictFromPickle(pickledPath)
+	except Exception:
+		log.error("Failed to load pickled add-ons state.", exc_info=True)  # noqa: G201
+	else:
+		jsonPath = os.path.join(configPath, addonHandler.STATE_FILENAME)
+		try:
+			if os.path.exists(jsonPath):
+				tryRemoveFile(jsonPath)
+		except Exception:
+			log.error(f"Failed to remove existing {jsonPath}.", exc_info=True)  # noqa: G201
+		else:
+			try:
+				with open(jsonPath, "wt", encoding="utf-8") as file:
+					json.dump(jsonState, file)
+			except Exception:
+				log.error("Failed to dump JSON add-ons state.", exc_info=True)  # noqa: G201
+	finally:
+		try:
+			os.replace(pickledPath, pickledPath + ".bak")
+		except Exception:
+			log.error("Failed to back up pickled add-ons state.", exc_info=True)  # noqa: G201
+
+
+def createPortableCopy(destPath: str, shouldCopyUserConfig: bool = True):
+	assert os.path.isabs(destPath), f"Destination path {destPath} is not absolute"
+	# Remove all the main executables always
+	_deleteFileGroupOrFail(destPath, {"nvda.exe", "nvda_noUIAccess.exe", "nvda_UIAccess.exe"})
+	removeOldProgramFiles(destPath)
+	copyProgramFiles(destPath)
+	tryCopyFile(os.path.join(destPath, "nvda_noUIAccess.exe"), os.path.join(destPath, "nvda.exe"))
+	if shouldCopyUserConfig:
+		copyUserConfig(os.path.join(destPath, "userConfig"))
+	removeOldLibFiles(destPath, rebootOK=True)
+
+
+def registerEaseOfAccess(installDir: str):
+	with winreg.CreateKeyEx(
+		winreg.HKEY_LOCAL_MACHINE,
+		RegistryKey.EASE_OF_ACCESS_APP.value,
+		0,
+		winreg.KEY_ALL_ACCESS | winreg.KEY_WOW64_64KEY,
+	) as appKey:
+		winreg.SetValueEx(
+			appKey,
+			"ApplicationName",
+			None,
+			winreg.REG_SZ,
+			buildVersion.name,
+		)
+		winreg.SetValueEx(
+			appKey,
+			"Description",
+			None,
+			winreg.REG_SZ,
+			versionInfo.longName,
+		)
+		winreg.SetValueEx(
+			appKey,
+			"Profile",
+			None,
+			winreg.REG_SZ,
+			'<HCIModel><Accommodation type="severe vision"/></HCIModel>',
+		)
+		winreg.SetValueEx(
+			appKey,
+			"SimpleProfile",
+			None,
+			winreg.REG_SZ,
+			"screenreader",
+		)
+		winreg.SetValueEx(
+			appKey,
+			"ATExe",
+			None,
+			winreg.REG_SZ,
+			"nvda.exe",
+		)
+		winreg.SetValueEx(
+			appKey,
+			"StartExe",
+			None,
+			winreg.REG_SZ,
+			os.path.join(installDir, "nvda.exe"),
+		)
+		winreg.SetValueEx(
+			appKey,
+			"StartParams",
+			None,
+			winreg.REG_SZ,
+			"--ease-of-access",
+		)
+		winreg.SetValueEx(
+			appKey,
+			"TerminateOnDesktopSwitch",
+			None,
+			winreg.REG_DWORD,
+			0,
+		)

@@ -1,0 +1,262 @@
+# A part of NonVisual Desktop Access (NVDA)
+# Copyright (C) 2014-2022 NV Access Limited, Cyrille Bougot
+# This file is covered by the GNU General Public License.
+# See the file COPYING for more details.
+
+"""Framework for presentation of math.
+Three types of presentation are supported: speech, braille and interaction.
+All of these accept MathML markup.
+Plugins can register their own implementation for any or all of these
+using ``registerProvider``.
+"""
+
+import re  # noqa: I001
+import typing
+from typing import List, Optional, Union  # noqa: F401, UP035
+
+from NVDAObjects.window import Window
+import controlTypes
+import api
+import virtualBuffers
+import vision
+import eventHandler
+from logHandler import log
+import ui
+import textInfos
+
+if typing.TYPE_CHECKING:
+	from locationHelper import RectLTRB
+	from NVDAObjects import NVDAObject
+	from speech.commands import SpeechCommand
+
+
+class MathPresentationProvider:
+	"""Implements presentation of math content.
+	A single provider does not need to implement all presentation types.
+	"""
+
+	def getSpeechForMathMl(self, mathMl: str) -> list[Union[str, "SpeechCommand"]]:
+		"""Get speech output for specified MathML markup.
+
+		:param mathMl: The MathML markup.
+		:return: A speech sequence.
+		"""
+		raise NotImplementedError
+
+	def getBrailleForMathMl(self, mathMl: str) -> str:
+		"""Get braille output for specified MathML markup.
+
+		:param mathMl: The MathML markup.
+		:return: A string of Unicode braille.
+		"""
+		raise NotImplementedError
+
+	def interactWithMathMl(self, mathMl: str) -> None:
+		"""Begin interaction with specified MathML markup.
+
+		:param mathMl: The MathML markup.
+		"""
+		raise NotImplementedError
+
+	def interactWithMathMlFromSource(
+		self,
+		mathMl: str,
+		sourceObj: "NVDAObject",
+	) -> None:
+		"""Begin interaction with specified MathML markup from the given source object.
+
+		The default implementation simply forwards to ``interactWithMathMl``; this should be overridden in subclasses.
+
+		:param mathMl: The MathML markup.
+		:param sourceObj: The source object containing the math, if known.
+		"""
+		self.interactWithMathMl(mathMl)
+
+
+speechProvider: MathPresentationProvider | None = None
+brailleProvider: MathPresentationProvider | None = None
+interactionProvider: MathPresentationProvider | None = None
+
+
+def registerProvider(
+	provider: MathPresentationProvider,
+	speech: bool = False,
+	braille: bool = False,
+	interaction: bool = False,
+) -> None:
+	"""Register a math presentation provider.
+
+	:param provider: The provider to register.
+	:param speech: Whether this provider supports speech output.
+	:param braille: Whether this provider supports braille output.
+	:param interaction: Whether this provider supports interaction.
+	"""
+	global speechProvider, brailleProvider, interactionProvider
+	if speech:
+		speechProvider = provider
+	if braille:
+		brailleProvider = provider
+	if interaction:
+		interactionProvider = provider
+
+
+def terminate() -> None:
+	"""Terminate the mathPres module."""
+	global speechProvider, brailleProvider, interactionProvider
+	speechProvider = None
+	brailleProvider = None
+	interactionProvider = None
+
+
+def initialize() -> None:
+	# Register builtin providers if a plugin hasn't registered others.
+	if not speechProvider or not brailleProvider or not interactionProvider:
+		from .MathCAT import MathCAT
+
+		try:
+			provider = MathCAT.MathCAT()
+		except:  # noqa: E722
+			log.warning("MathCAT not available.")
+		else:
+			MathCAT.MathCATInteraction._createNavScripts()
+			registerProvider(
+				provider,
+				speech=not speechProvider,
+				braille=not brailleProvider,
+				interaction=not interactionProvider,
+			)
+
+
+class MathInteractionNVDAObject(Window):
+	"""Base class for a fake NVDAObject which can be focused while interacting with math.
+	Subclasses can bind commands to interact with the content
+	and produce speech and braille output as they wish.
+	To begin interaction, call ``setFocus``.
+	Pressing escape exits interaction.
+	"""
+
+	role = controlTypes.Role.MATH
+	# Override the window name.
+	name = None
+	# Any tree interceptor should not apply here.
+	treeInterceptor = None
+
+	def __init__(
+		self,
+		provider: MathPresentationProvider | None = None,
+		mathMl: str | None = None,
+		sourceObj: "NVDAObject | None" = None,
+	) -> None:
+		"""Initialize a math interaction object.
+
+		:param provider: The presentation provider.
+		:param mathMl: The MathML being presented.
+		:param sourceObj: The source object containing the math, if known.
+		"""
+		self.parent = parent = api.getFocusObject()
+		self.provider = provider
+		self.sourceObj: NVDAObject | None = sourceObj
+		super().__init__(windowHandle=parent.windowHandle)
+
+	def setFocus(self):
+		ti = self.parent.treeInterceptor
+		if isinstance(ti, virtualBuffers.VirtualBuffer):
+			# Normally, when entering browse mode from a descendant (e.g. dialog),
+			# we want the cursor to move to the focus (#3145).
+			# However, we don't want this for math, as math isn't focusable.
+			ti._enteringFromOutside = True
+		eventHandler.executeEvent("gainFocus", self)
+
+	def script_exit(self, gesture):
+		eventHandler.executeEvent("gainFocus", self.parent)
+
+	def event_loseFocus(self) -> None:
+		if vision.handler:
+			vision.handler.handleMathNavigation(None)
+		super().event_loseFocus()
+
+	# Translators: Describes a command.
+	script_exit.__doc__ = _("Exit math interaction")
+
+	def getMathSourceObjectRect(self) -> "RectLTRB | None":
+		"""Get the navigation rectangle for a supported web math source object."""
+		raise NotImplementedError
+
+	__gestures = {  # noqa: RUF012
+		"kb:escape": "exit",
+	}
+
+
+RE_STRIP_XML_PREFIX = re.compile(r"^.*?(?=<(?:\w+:)?math[ >])")
+
+
+def stripExtraneousXml(xml):
+	"""Strip extraneous XML from MathML.
+	This is needed where retrieving MathML produces more than just the math tag.
+	Currently, this strips anything before the opening of the math tag.
+	"""
+	return RE_STRIP_XML_PREFIX.sub("", xml)
+
+
+def getMathMlFromTextInfo(pos: textInfos.TextInfo) -> str | None:
+	"""Get MathML (if any) at the start of a TextInfo.
+
+	:param pos: The TextInfo in question.
+	:return: The MathML or ``None`` if there is no math.
+	"""
+	pos = pos.copy()
+	pos.expand(textInfos.UNIT_CHARACTER)
+	for item in reversed(pos.getTextWithFields()):
+		if not isinstance(item, textInfos.FieldCommand) or item.command != "controlStart":
+			continue
+		field = item.field
+		if field.get("role") != controlTypes.Role.MATH:
+			continue
+		try:
+			return pos.getMathMl(field)
+		except (NotImplementedError, LookupError):
+			continue
+	return None
+
+
+def interactWithMathMl(mathMl: str, sourceObj: "NVDAObject | None" = None) -> None:
+	"""Begin interaction with specified MathML markup, reporting any errors to the user.
+
+	This is intended to be called from scripts.
+	If interaction isn't supported, this will be reported to the user.
+	The script should return after calling this function.
+
+	:param mathMl: The MathML markup.
+	:param sourceObj: The source object containing the math, if known.
+	"""
+	if not interactionProvider:
+		# Translators: Reported when the user attempts math interaction
+		# but math interaction is not supported.
+		ui.message(_("Math interaction not supported."))
+		return
+	if sourceObj is not None:
+		return interactionProvider.interactWithMathMlFromSource(mathMl, sourceObj=sourceObj)
+	else:
+		return interactionProvider.interactWithMathMl(mathMl)
+
+
+RE_MATH_LANG = re.compile(r"""<math.*? xml:lang=["']([^"']+)["'].*?>""")
+
+
+def getLanguageFromMath(mathMl):
+	"""Get the language specified in a math tag.
+
+	:return: The language or ``None`` if unspecified.
+	"""
+	m = RE_MATH_LANG.search(mathMl)
+	if m:
+		return m.group(1)
+	return None
+
+
+RE_MATH_APPEND = re.compile(r"(<math[^>]*)>")
+
+
+def insertLanguageIntoMath(mathMl, language):
+	"""Insert the specified language into a math tag."""
+	return RE_MATH_APPEND.sub(r'\1 xml:lang="%s">' % language, mathMl, count=1)  # noqa: UP031

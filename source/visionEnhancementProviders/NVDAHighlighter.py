@@ -1,0 +1,627 @@
+# A part of NonVisual Desktop Access (NVDA)
+# This file is covered by the GNU General Public License.
+# See the file COPYING for more details.
+# Copyright (C) 2018-2025 NV Access Limited, Babbage B.V., Takuya Nishimoto, hwf1324
+
+"""Default highlighter based on GDI Plus."""
+
+import threading
+import weakref
+from ctypes import WinError, byref
+from ctypes.wintypes import MSG, RECT
+from typing import TYPE_CHECKING, NamedTuple, override
+
+import api
+import core
+import vision
+import winBindings.gdi32
+import winGDI
+import winUser
+import wx
+from autoSettingsUtils.autoSettings import SupportedSettingType
+from autoSettingsUtils.driverSetting import BooleanDriverSetting
+from colors import RGB
+from gui.settingsDialogs import (
+	AutoSettingsMixin,
+	SettingsPanel,
+	VisionProviderStateControl,
+)
+from locationHelper import RectLTRB, RectLTWH
+from logHandler import log
+from mouseHandler import getTotalWidthAndHeightAndMinimumPosition
+from vision import providerBase
+from vision.constants import Context
+from vision.util import getContextRect
+from vision.visionHandlerExtensionPoints import EventExtensionPoints
+from winAPI.messageWindow import WindowMessage
+from winBindings import user32
+from windowUtils import CustomWindow
+
+if TYPE_CHECKING:
+	from cursorManager import CursorManager
+	from NVDAObjects import NVDAObject
+	from winBindings.user32 import WNDCLASSEXW
+
+
+class HighlightStyle(NamedTuple):
+	"""Represents the style of a highlight for a particular context.
+
+	:param color: The color to use for the style
+	:param width: The width of the lines to be drawn, in pixels.
+		A higher width reduces the inner dimensions of the rectangle.
+		Therefore, if you need to increase the outer dimensions of the rectangle,
+		you need to increase the margin as well.
+	:param style: The style of the lines to be drawn;
+		One of the C{winGDI.DashStyle*} enumeration constants.
+	:param margin: The number of pixels between the highlight's rectangle
+		and the rectangle of the object to be highlighted.
+		A higher margin stretches the highlight's rectangle.
+		This value may also be negative.
+	"""
+
+	color: RGB
+	width: int
+	style: int
+	margin: int
+
+
+BLUE = RGB(0x03, 0x36, 0xFF)
+PINK = RGB(0xFF, 0x02, 0x66)
+YELLOW = RGB(0xFF, 0xDE, 0x03)
+DASH_BLUE = HighlightStyle(BLUE, 5, winGDI.DashStyleDash, 5)
+SOLID_PINK = HighlightStyle(PINK, 5, winGDI.DashStyleSolid, 5)
+SOLID_BLUE = HighlightStyle(BLUE, 5, winGDI.DashStyleSolid, 5)
+SOLID_YELLOW = HighlightStyle(YELLOW, 2, winGDI.DashStyleSolid, 2)
+
+
+class HighlightWindow(CustomWindow):
+	transparency = 0xFF
+	className = "NVDAHighlighter"
+	windowName = "NVDA Highlighter Window"
+	windowStyle = winUser.WS_POPUP | winUser.WS_DISABLED
+	extendedWindowStyle = (
+		# Ensure that the window is on top of all other windows
+		winUser.WS_EX_TOPMOST
+		# A layered window ensures that L{transparentColor} will be considered transparent, when painted
+		| winUser.WS_EX_LAYERED
+		# Ensure that the window can't be activated when pressing alt+tab
+		| winUser.WS_EX_NOACTIVATE
+		# Make this a transparent window,
+		# primarily for accessibility APIs to ignore this window when getting a window from a screen point
+		| winUser.WS_EX_TRANSPARENT
+		# Ensure that the window is treated as a tool window,
+		# so that it will not be shown in the task bar
+		| winUser.WS_EX_TOOLWINDOW
+	)
+	transparentColor = 0  # Black
+
+	@override
+	@classmethod
+	def _get__wClass(cls) -> "WNDCLASSEXW":
+		wClass = super()._wClass
+		wClass.style = winUser.CS_HREDRAW | winUser.CS_VREDRAW
+		wClass.hbrBackground = winBindings.gdi32.CreateSolidBrush(cls.transparentColor)
+		return wClass
+
+	def updateLocationForDisplays(self) -> None:
+		if vision._isDebug():
+			log.debug("Updating NVDAHighlighter window location for displays")
+		displays: list[wx.Rect] = [wx.Display(i).GetGeometry() for i in range(wx.Display.GetCount())]
+		screenWidth, screenHeight, minPos = getTotalWidthAndHeightAndMinimumPosition(displays)
+		# Hack: Windows has a "feature" that will stop desktop shortcut hotkeys from working
+		# when a window is full screen.
+		# Removing one line of pixels from the bottom of the screen will fix this.
+		left = minPos.x
+		top = minPos.y
+		width = screenWidth
+		height = screenHeight - 1
+		self.location = RectLTWH(left, top, width, height)
+		user32.ShowWindow(self.handle, winUser.SW_HIDE)
+		if not user32.SetWindowPos(
+			self.handle,
+			winUser.HWND_TOPMOST,
+			left,
+			top,
+			width,
+			height,
+			winUser.SWP_NOACTIVATE,
+		):
+			raise WinError()
+		user32.ShowWindow(self.handle, winUser.SW_SHOWNA)
+		# Location changed, force a full refresh
+		self._prevContextRects = {}
+		user32.InvalidateRect(self.handle, None, True)
+
+	def __init__(self, highlighter: "NVDAHighlighter"):
+		if vision._isDebug():
+			log.debug("initializing NVDAHighlighter window")
+		super().__init__(
+			windowName=self.windowName,
+			windowStyle=self.windowStyle,
+			extendedWindowStyle=self.extendedWindowStyle,
+		)
+		self.location = None
+		self.highlighterRef = weakref.ref(highlighter)
+		# Store the rendered rects from the previous frame to calculate dirty regions
+		self._prevContextRects: dict[Context, RectLTRB] = {}
+
+		winUser.SetLayeredWindowAttributes(
+			self.handle,
+			self.transparentColor,
+			self.transparency,
+			winUser.LWA_ALPHA | winUser.LWA_COLORKEY,
+		)
+		self.updateLocationForDisplays()
+		if not user32.UpdateWindow(self.handle):
+			raise WinError()
+
+	@override
+	def windowProc(self, hwnd: int, msg: int, wParam: int, lParam: int) -> None:
+		if msg == winUser.WM_PAINT:
+			self._paint()
+			# Ensure the window is top most
+			user32.SetWindowPos(
+				self.handle,
+				winUser.HWND_TOPMOST,
+				0,
+				0,
+				0,
+				0,
+				winUser.SWP_NOACTIVATE | winUser.SWP_NOMOVE | winUser.SWP_NOSIZE,
+			)
+		elif msg == winUser.WM_DESTROY:
+			user32.PostQuitMessage(0)
+		elif msg == winUser.WM_TIMER:
+			self.refresh()
+		elif msg == WindowMessage.DISPLAY_CHANGE:
+			# wx might not be aware of the display change at this point
+			core.callLater(100, self.updateLocationForDisplays)
+
+	def _getDrawRects(self, highlighter: "NVDAHighlighter") -> dict[Context, RectLTRB]:
+		"""
+		Calculates the logical rectangles that should be drawn based on the highlighter's state.
+		Handles logic like merging Focus and Navigator if they overlap.
+		"""
+		contextRects: dict[Context, RectLTRB] = {}
+		for context in highlighter.enabledContexts:
+			rect = highlighter.contextToRectMap.get(context)
+			if not rect:
+				continue
+			elif context == Context.NAVIGATOR and contextRects.get(Context.FOCUS) == rect:
+				# When the focus overlaps the navigator object, which is usually the case,
+				# show a different highlight style.
+				# Focus is in contextRects, do not show the standalone focus highlight.
+				contextRects.pop(Context.FOCUS)
+				# Navigator object might be in contextRects as well
+				contextRects.pop(Context.NAVIGATOR, None)
+				context = Context.FOCUS_NAVIGATOR
+			contextRects[context] = rect
+		return contextRects
+
+	def _mapRectToClient(self, rect: RectLTRB, style: HighlightStyle) -> RectLTRB | None:
+		"""
+		Transforms a screen rectangle to a client rectangle ready for drawing.
+		Applies: Intersection with Window -> Logical mapping -> Client mapping -> Style Margin.
+		Returns None if mapping fails.
+		"""
+		# Before calculating logical coordinates,
+		# make sure the rectangle falls within the highlighter window
+		rect = rect.intersection(self.location)
+
+		try:
+			return rect.toLogical(self.handle).toClient(self.handle).expandOrShrink(style.margin)
+		except RuntimeError:
+			# Usually happens if window handle is invalid or screen conversion fails
+			log.debugWarning("", exc_info=True)
+			return None
+
+	def _paint(self) -> None:
+		highlighter = self.highlighterRef()
+		if not highlighter:
+			# The highlighter instance died unexpectedly, kill the window as well
+			user32.PostQuitMessage(0)
+			return
+
+		# Get the rects we intend to draw
+		contextRects = self._getDrawRects(highlighter)
+
+		if not contextRects:
+			return
+
+		with winUser.paint(self.handle) as hdc, winGDI.GDIPlusGraphicsContext(hdc) as graphicsContext:
+			for context, rect in contextRects.items():
+				HighlightStyle = highlighter._ContextStyles[context]
+				rect = self._mapRectToClient(rect, HighlightStyle)
+				if not rect:
+					continue
+
+				with winGDI.GDIPlusPen(
+					HighlightStyle.color.toGDIPlusARGB(),
+					HighlightStyle.width,
+					HighlightStyle.style,
+				) as pen:
+					winGDI.gdiPlusDrawRectangle(graphicsContext, pen, *rect.toLTWH())
+
+	def _invalidateContextRect(self, rect: RectLTRB, style: HighlightStyle) -> None:
+		"""
+		Invalidates a specific rectangle region on the screen (Dirty Rectangle).
+		Calculates the visual bounding box based on the object rect, margin and pen width.
+		"""
+		try:
+			rect = self._mapRectToClient(rect, style)
+			if rect:
+				# We must expand the invalidation rect to account for the Pen's width.
+				# Adding a small buffer (+2 pixels) to avoid anti-aliasing artifacts left behind.
+				padding = style.width + 2
+				rect = rect.expandOrShrink(padding)
+
+				# Create WINAPI RECT structure
+				winRect = RECT(rect.left, rect.top, rect.right, rect.bottom)
+				user32.InvalidateRect(self.handle, byref(winRect), True)
+		except RuntimeError:
+			user32.InvalidateRect(self.handle, None, True)
+
+	def refresh(self) -> None:
+		highlighter = self.highlighterRef()
+		if not highlighter:
+			return
+
+		# Calculate the new state (what we want to draw now)
+		currentContextRects = self._getDrawRects(highlighter)
+
+		# Compare with the previous state to determine Dirty Rectangles
+		# Check for changed or removed contexts
+		rectsChanged = False
+
+		# Identify all unique contexts involved in previous and current frame
+		allContexts = set(self._prevContextRects).union(currentContextRects)
+
+		for context in allContexts:
+			prevRect = self._prevContextRects.get(context)
+			currRect = currentContextRects.get(context)
+
+			if prevRect != currRect:
+				rectsChanged = True
+				style = highlighter._ContextStyles[context]
+
+				# If there was a rect previously, invalidate its old position (to erase it)
+				if prevRect:
+					self._invalidateContextRect(prevRect, style)
+
+				# If there is a rect now, invalidate its new position (to draw it)
+				if currRect:
+					self._invalidateContextRect(currRect, style)
+
+		# Update state cache
+		if rectsChanged:
+			self._prevContextRects = currentContextRects
+
+
+_contextOptionLabelsWithAccelerators = {
+	# Translators: shown for a highlighter setting that toggles
+	# highlighting the system focus.
+	Context.FOCUS: _("Highlight system fo&cus"),
+	# Translators: shown for a highlighter setting that toggles
+	# highlighting the browse mode cursor.
+	Context.BROWSEMODE: _("Highlight browse &mode cursor"),
+	# Translators: shown for a highlighter setting that toggles
+	# highlighting the navigator object.
+	Context.NAVIGATOR: _("Highlight navigator &object"),
+}
+
+_supportedContexts = (Context.FOCUS, Context.NAVIGATOR, Context.BROWSEMODE)
+
+
+class NVDAHighlighterSettings(providerBase.VisionEnhancementProviderSettings):
+	# Default settings for parameters
+	highlightFocus = False
+	highlightNavigator = False
+	highlightBrowseMode = False
+
+	@override
+	@classmethod
+	def getId(cls) -> str:
+		return "NVDAHighlighter"
+
+	@override
+	@classmethod
+	def getDisplayName(cls) -> str:
+		# Translators: Description for NVDA's built-in screen highlighter.
+		return _("Visual Highlight")
+
+	@override
+	def _get_supportedSettings(self) -> SupportedSettingType:
+		return [
+			BooleanDriverSetting(
+				"highlight%s" % (context[0].upper() + context[1:]),
+				_contextOptionLabelsWithAccelerators[context],
+				defaultVal=True,
+			)
+			for context in _supportedContexts
+		]
+
+
+class NVDAHighlighterGuiPanel(
+	AutoSettingsMixin,
+	SettingsPanel,
+):
+	_enableCheckSizer: wx.BoxSizer
+	_enabledCheckbox: wx.CheckBox
+
+	helpId = "VisionSettingsFocusHighlight"
+
+	def __init__(
+		self,
+		parent: wx.Window,
+		providerControl: VisionProviderStateControl,
+	) -> None:
+		self._providerControl = providerControl
+		initiallyEnabledInConfig = NVDAHighlighter.isEnabledInConfig()
+		if not initiallyEnabledInConfig:
+			settingsStorage: NVDAHighlighterSettings = self._getSettingsStorage()
+			settingsToCheck = [
+				settingsStorage.highlightBrowseMode,
+				settingsStorage.highlightFocus,
+				settingsStorage.highlightNavigator,
+			]
+			if any(settingsToCheck):
+				log.debugWarning(
+					"Highlighter disabled in config while some of its settings are enabled. "
+					"This will be corrected",
+				)
+				settingsStorage.highlightBrowseMode = False
+				settingsStorage.highlightFocus = False
+				settingsStorage.highlightNavigator = False
+		super().__init__(parent)
+
+	@override
+	def _buildGui(self) -> None:
+		self.mainSizer = wx.BoxSizer(wx.VERTICAL)
+
+		self._enabledCheckbox = wx.CheckBox(
+			self,
+			#  Translators: The label for a checkbox that enables / disables focus highlighting
+			#  in the NVDA Highlighter vision settings panel.
+			label=_("&Enable Highlighting"),
+			style=wx.CHK_3STATE,
+		)
+
+		self.mainSizer.Add(self._enabledCheckbox)
+		self.mainSizer.AddSpacer(size=self.scaleSize(10))
+		# this options separator is done with text rather than a group box because a groupbox is too verbose,
+		# but visually some separation is helpful, since the rest of the options are really sub-settings.
+		self.optionsText = wx.StaticText(
+			self,
+			# Translators: The label for a group box containing the NVDA highlighter options.
+			label=_("Options:"),
+		)
+		self.mainSizer.Add(self.optionsText)
+
+		self.lastControl = self.optionsText
+		self.settingsSizer = wx.BoxSizer(wx.VERTICAL)
+		self.makeSettings(self.settingsSizer)
+		self.mainSizer.Add(self.settingsSizer, border=self.scaleSize(15), flag=wx.LEFT | wx.EXPAND)
+		self.mainSizer.Fit(self)
+		self.SetSizer(self.mainSizer)
+
+	@override
+	def getSettings(self) -> NVDAHighlighterSettings:
+		# AutoSettingsMixin uses the getSettings method (via getSettingsStorage) to get the instance which is
+		# used to get / set attributes. The attributes must match the id's of the settings.
+		# We want them set on our settings instance.
+		return VisionEnhancementProvider.getSettings()
+
+	@override
+	def makeSettings(self, sizer: wx.BoxSizer) -> None:
+		self.updateDriverSettings()
+		# bind to all check box events
+		self.Bind(wx.EVT_CHECKBOX, self._onCheckEvent)
+		self._updateEnabledState()
+
+	@override
+	def onPanelActivated(self) -> None:
+		self.lastControl = self.optionsText
+
+	def _updateEnabledState(self) -> None:
+		settingsStorage: NVDAHighlighterSettings = self._getSettingsStorage()
+		settingsToTriggerActivation = [
+			settingsStorage.highlightBrowseMode,
+			settingsStorage.highlightFocus,
+			settingsStorage.highlightNavigator,
+		]
+		isAnyEnabled = any(settingsToTriggerActivation)
+		if all(settingsToTriggerActivation):
+			self._enabledCheckbox.Set3StateValue(wx.CHK_CHECKED)
+		elif isAnyEnabled:
+			self._enabledCheckbox.Set3StateValue(wx.CHK_UNDETERMINED)
+		else:
+			self._enabledCheckbox.Set3StateValue(wx.CHK_UNCHECKED)
+
+		if not self._ensureEnableState(isAnyEnabled) and isAnyEnabled:
+			self._onEnableFailure()
+
+	def _onEnableFailure(self) -> None:
+		"""Initialization of Highlighter failed. Reset settings / GUI"""
+		settingsStorage: NVDAHighlighterSettings = self._getSettingsStorage()
+		settingsStorage.highlightBrowseMode = False
+		settingsStorage.highlightFocus = False
+		settingsStorage.highlightNavigator = False
+		self.updateDriverSettings()
+		self._updateEnabledState()
+
+	def _ensureEnableState(self, shouldBeEnabled: bool) -> bool:
+		currentlyEnabled = bool(self._providerControl.getProviderInstance())
+		if shouldBeEnabled and not currentlyEnabled:
+			return self._providerControl.startProvider()
+		elif not shouldBeEnabled and currentlyEnabled:
+			return self._providerControl.terminateProvider()
+		return True
+
+	def _onCheckEvent(self, evt: wx.CommandEvent) -> None:
+		settingsStorage: NVDAHighlighterSettings = self._getSettingsStorage()
+		if evt.GetEventObject() is self._enabledCheckbox:
+			isEnableAllChecked = evt.IsChecked()
+			settingsStorage.highlightBrowseMode = isEnableAllChecked
+			settingsStorage.highlightFocus = isEnableAllChecked
+			settingsStorage.highlightNavigator = isEnableAllChecked
+			if not self._ensureEnableState(isEnableAllChecked) and isEnableAllChecked:
+				self._onEnableFailure()
+			self.updateDriverSettings()
+		else:
+			self._updateEnabledState()
+
+		providerInst: NVDAHighlighter | None = self._providerControl.getProviderInstance()
+		if providerInst:
+			providerInst.refresh()
+
+
+class NVDAHighlighter(providerBase.VisionEnhancementProvider):
+	_ContextStyles = {  # noqa: RUF012
+		Context.FOCUS: DASH_BLUE,
+		Context.NAVIGATOR: SOLID_PINK,
+		Context.FOCUS_NAVIGATOR: SOLID_BLUE,
+		Context.BROWSEMODE: SOLID_YELLOW,
+	}
+	_refreshInterval = 100
+	customWindowClass = HighlightWindow
+	_settings = NVDAHighlighterSettings()
+	_window: HighlightWindow | None = None
+	enabledContexts: tuple[Context, ...]  # type info for autoprop: :meth:~._get_enableContexts
+
+	@override
+	@classmethod
+	def getSettings(cls) -> NVDAHighlighterSettings:
+		return cls._settings
+
+	@override
+	@classmethod
+	def getSettingsPanelClass(cls) -> type[NVDAHighlighterGuiPanel]:
+		"""Returns the class to be used in order to construct a settings panel for NVDAHighlighter provider."""
+		return NVDAHighlighterGuiPanel
+
+	@override
+	@classmethod
+	def canStart(cls) -> bool:
+		return True
+
+	@override
+	def registerEventExtensionPoints(
+		self,
+		extensionPoints: EventExtensionPoints,
+	) -> None:
+		extensionPoints.post_focusChange.register(self.handleFocusChange)
+		extensionPoints.post_reviewMove.register(self.handleReviewMove)
+		extensionPoints.post_browseModeMove.register(self.handleBrowseModeMove)
+		extensionPoints.post_mathNavigation.register(self.handleMathNavigation)
+
+	def __init__(self):
+		super().__init__()
+		log.debug("Starting NVDAHighlighter")
+		self.contextToRectMap: dict[Context, RectLTRB | None] = {}
+		winGDI.gdiPlusInitialize()
+		self._highlighterThread = threading.Thread(
+			name=f"{self.__class__.__module__}.{self.__class__.__qualname__}",
+			target=self._run,
+			daemon=True,
+		)
+		self._highlighterRunningEvent = threading.Event()
+		self._highlighterThread.start()
+		# Make sure the highlighter thread doesn't exit early.
+		waitResult = self._highlighterRunningEvent.wait(0.2)
+		if waitResult is False or not self._highlighterThread.is_alive():
+			raise RuntimeError("Highlighter thread wasn't able to initialize correctly")
+
+	@override
+	def terminate(self) -> None:
+		log.debug("Terminating NVDAHighlighter")
+		if self._highlighterThread and self._window and self._window.handle:
+			if not user32.PostThreadMessage(self._highlighterThread.ident, winUser.WM_QUIT, 0, 0):
+				raise WinError()
+			else:
+				self._highlighterThread.join()
+			self._highlighterThread = None
+		winGDI.gdiPlusTerminate()
+		self.contextToRectMap.clear()
+		super().terminate()
+
+	def _run(self) -> None:
+		try:
+			if vision._isDebug():
+				log.debug("Starting NVDAHighlighter thread")
+
+			window = self._window = self.customWindowClass(self)
+			timer = winUser.WinTimer(window.handle, 0, self._refreshInterval, None)
+			self._highlighterRunningEvent.set()  # notify main thread that initialisation was successful
+			msg = MSG()
+			while (res := winUser.getMessage(byref(msg), None, 0, 0)) > 0:
+				user32.TranslateMessage(byref(msg))
+				user32.DispatchMessage(byref(msg))
+			if res == -1:
+				# See the return value section of
+				# https://docs.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getmessage
+				raise WinError()
+			if vision._isDebug():
+				log.debug("Quit message received on NVDAHighlighter thread")
+			timer.terminate()
+			window.destroy()
+		except Exception:
+			log.exception("Exception in NVDA Highlighter thread")
+
+	def updateContextRect(
+		self,
+		context: Context,
+		rect: RectLTRB | None = None,
+		obj: "NVDAObject | None" = None,
+	) -> None:
+		"""Updates the position rectangle of the highlight for the specified context.
+		If rect is specified, the method directly writes the rectangle to the contextToRectMap.
+		Otherwise, it will call L{getContextRect}
+		"""
+		if context not in self.enabledContexts:
+			return
+		if rect is None:
+			try:
+				rect = getContextRect(context, obj=obj)
+			except (LookupError, ValueError, RuntimeError, TypeError):
+				rect = None
+		self.contextToRectMap[context] = rect
+
+	def handleFocusChange(self, obj: "NVDAObject") -> None:
+		self.updateContextRect(context=Context.FOCUS, obj=obj)
+		if not api.isObjectInActiveTreeInterceptor(obj):
+			self.contextToRectMap.pop(Context.BROWSEMODE, None)
+		else:
+			self.handleBrowseModeMove()
+
+	def handleReviewMove(self, context: Context) -> None:
+		self.updateContextRect(context=Context.NAVIGATOR)
+
+	def handleBrowseModeMove(self, obj: "CursorManager | None" = None) -> None:
+		self.updateContextRect(context=Context.BROWSEMODE)
+
+	def handleMathNavigation(self, rect: RectLTRB | None) -> None:
+		"""Update the browse mode highlight for math navigation.
+
+		:param rect: The current math navigation rectangle, or ``None`` if no rectangle is available.
+		"""
+		if rect is None:
+			self.contextToRectMap.pop(Context.BROWSEMODE, None)
+			self.updateContextRect(context=Context.BROWSEMODE)
+			return
+		self.updateContextRect(context=Context.BROWSEMODE, rect=rect)
+
+	def refresh(self) -> None:
+		"""Refreshes the screen positions of the enabled highlights."""
+		if self._window and self._window.handle:
+			self._window.refresh()
+
+	def _get_enabledContexts(self) -> tuple[Context, ...]:
+		"""Gets the contexts for which the highlighter is enabled."""
+		return tuple(
+			context
+			for context in _supportedContexts
+			if getattr(self.getSettings(), "highlight%s" % (context[0].upper() + context[1:]))
+		)
+
+
+VisionEnhancementProvider = NVDAHighlighter
