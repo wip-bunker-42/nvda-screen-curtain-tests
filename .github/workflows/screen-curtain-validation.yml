@@ -1,0 +1,119 @@
+name: Screen Curtain regression validation
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Exact source snapshot commit to test
+        required: true
+        type: string
+      baseline_run:
+        description: Successful upstream source-preparation run with the native build cache
+        required: true
+        type: string
+      scope:
+        description: Tests to run
+        required: true
+        type: choice
+        options:
+          - backend
+          - panel
+          - all
+      checks:
+        description: Run lint, types, translations and licenses as well
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: windows-2025-vs2026
+    timeout-minutes: 20
+    env:
+      SOURCE_SHA: ${{ inputs.source_sha }}
+      BASELINE_SHA: fc2d12b6355e2ca2f8fed99f6ed97a77adf6d941
+      TEST_SCOPE: ${{ inputs.scope }}
+    steps:
+      - name: Restore verified upstream native build
+        uses: actions/cache/restore@v5
+        with:
+          path: .
+          key: refs/heads/main-${{ inputs.baseline_run }}-3.13.15-x64
+          fail-on-cache-miss: true
+      - name: Check out the exact source snapshot without deleting built dependencies
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.source_sha }}
+          clean: false
+          fetch-depth: 1
+      - name: Install the pinned Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.13.15'
+          architecture: x64
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          python-version: cpython-3.13.15-windows-x86_64-none
+      - name: Verify source identity and unchanged native build inputs
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:SOURCE_SHA -notmatch '^[0-9a-f]{40}$') { throw 'Expected a full source commit SHA' }
+          $actual = git rev-parse HEAD
+          if ($actual -ne $env:SOURCE_SHA) { throw "Unexpected source revision: $actual" }
+          git fetch origin $env:BASELINE_SHA --depth=1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git diff --exit-code $env:BASELINE_SHA $env:SOURCE_SHA -- nvdaHelper include miscDeps launcher uninstaller site_scons sconstruct .python-versions pyproject.toml uv.lock source/comInterfaces_sconscript
+          if ($LASTEXITCODE -ne 0) { throw 'Native inputs changed: run a full source build instead of this cached validation' }
+          "Source commit: $actual" >> $env:GITHUB_STEP_SUMMARY
+          "Source tree: $(git rev-parse 'HEAD^{tree}')" >> $env:GITHUB_STEP_SUMMARY
+          New-Item -ItemType Directory -Force testOutput/unit,testOutput/lint,testOutput/license | Out-Null
+      - name: Run regression or complete unit suite
+        shell: pwsh
+        run: |
+          $testArgs = @('-v')
+          switch ($env:TEST_SCOPE) {
+            'backend' { $testArgs += @('-k', 'test_screenCurtain', '-k', 'test_globalCommands') }
+            'panel' { $testArgs += @('-k', 'test_privacyAndSecuritySettingsPanel', '-k', 'test_screenCurtain', '-k', 'test_globalCommands') }
+            'all' { }
+            default { throw 'Unexpected test scope' }
+          }
+          & .\rununittests.bat @testArgs *> testOutput/unit/console.log
+          $testExit = $LASTEXITCODE
+          Get-Content testOutput/unit/console.log -Tail 100
+          "Unit test exit code: $testExit" >> $env:GITHUB_STEP_SUMMARY
+          exit $testExit
+      - name: Run repository lint and type checks
+        if: ${{ inputs.checks }}
+        shell: pwsh
+        run: |
+          .\runlint.bat testOutput/lint *> testOutput/lint/console.log
+          $checkExit = $LASTEXITCODE
+          Get-Content testOutput/lint/console.log -Tail 70
+          exit $checkExit
+      - name: Check translator comments
+        if: ${{ inputs.checks }}
+        shell: pwsh
+        run: |
+          $env:PATH = "$PWD;$env:PATH"
+          .\runcheckpot.bat *> testOutput/translation-console.log
+          $checkExit = $LASTEXITCODE
+          Get-Content testOutput/translation-console.log -Tail 45
+          exit $checkExit
+      - name: Check dependency licenses
+        if: ${{ inputs.checks }}
+        shell: pwsh
+        run: |
+          .\runlicensecheck.bat *> testOutput/license/console.log
+          $checkExit = $LASTEXITCODE
+          Get-Content testOutput/license/console.log -Tail 45
+          exit $checkExit
+      - name: Upload verification evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: screen-curtain-validation-${{ inputs.scope }}-${{ github.run_id }}
+          path: testOutput
